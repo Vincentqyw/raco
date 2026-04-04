@@ -1,0 +1,61 @@
+# Default configuration for RaCo training
+
+# Dataset configuration
+dataset:
+  name: oxford_paris
+  data_root: /mnt/e/datasets/raco
+  datasets: [roxford5k, rparis6k]
+  image_size: [640, 640]
+  train_size: 5000
+  val_size: 200
+  batch_size: 2
+  num_workers: 4
+  seed: 0
+  homography:
+    difficulty: 0.8
+    translation: 1.0
+    max_angle: 60
+    n_angles: 10
+    min_convexity: 0.05
+    patch_shape: null  # null for same as image_size
+  photometric:
+    p: 0.5
+
+# Model configuration
+model:
+  name: raco
+  max_num_keypoints: 512
+  nms_radius: 3
+  subpixel_sampling: true
+  subpixel_temp: 0.5
+  use_ranker: true
+  use_covariance: true
+  sort_by_ranker: false
+  detector:
+    d_max: 1.2
+    rho_pos: 1.0
+    rho_neg_max: 1.0e-2
+  ranker:
+    lambda_ranker: 1.0
+
+# Training configuration
+train:
+  stage: detector
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  detector_steps: 200000
+  ranker_epochs: 1
+  covariance_steps: 20000
+  log_interval: 100
+  save_interval: 5000
+  eval_interval: 5000
+  eval_during_training: true
+
+# Output configuration
+output:
+  output_dir: ./outputs
+
+# Evaluation configuration
+eval:
+  batch_size: 1
+  num_workers: 4

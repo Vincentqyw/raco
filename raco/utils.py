@@ -135,3 +135,21 @@ def rbd(data: dict) -> dict:
         k: v[0] if isinstance(v, (torch.Tensor, np.ndarray, list)) else v
         for k, v in data.items()
     }
+
+
+def get_config_value(args, config, key: str, default=None):
+    """Get config value from args or config dict.
+
+    Args:
+        args: Namespace with command-line arguments
+        config: Config dict loaded from YAML
+        key: Config key name
+        default: Default value if not found in args or config
+
+    Returns:
+        Value from args, config, or default (in that priority order)
+    """
+    value = getattr(args, key, None)
+    if value is not None:
+        return value
+    return config.get(key, default)
