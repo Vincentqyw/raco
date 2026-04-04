@@ -157,7 +157,7 @@ def compute_reprojection_error_map(
     prob_map_shape: Tuple[int, int, int, int],
     homography: torch.Tensor,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute reprojection error for each pixel location in the probability map.
 
@@ -168,6 +168,7 @@ def compute_reprojection_error_map(
 
     Returns:
         errors: (B, H*W) reprojection errors
+        valid_mask: (B, H*W) whether each pixel is valid (in bounds after transform)
     """
     B, _, H, W = prob_map_shape
 
@@ -190,9 +191,11 @@ def compute_reprojection_error_map(
     dy = coords_in_b[..., 1] - pixel_coords[..., 1]
     displacement = torch.sqrt(dx**2 + dy**2)
 
-    errors = torch.where(in_bounds, displacement, torch.full_like(displacement, 1e6))
+    # Clamp max error for numerical stability
+    max_error = torch.tensor(100.0, device=device)
+    errors = torch.where(in_bounds, displacement, max_error)
 
-    return errors
+    return errors, in_bounds
 
 
 def symmetric_homography_error(kpts0, kpts1, H_gt):

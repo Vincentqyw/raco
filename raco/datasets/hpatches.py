@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import cv2
+from loguru import logger
 import numpy as np
 import torch
 
@@ -55,6 +56,8 @@ class HPatchesDataset(BaseDataset):
         "split": "test",
         "scene_type": "all",  # all, vantage, illumination
         "ignore_large_scenes": True,  # Ignore scenes in IGNORED_SCENES
+        "max_scenes": None,  # Limit number of scenes for fast eval (None = all)
+        "max_pairs_per_scene": None,  # Limit pairs per scene (None = all 5 pairs)
     }
 
     def _init(self, conf):
@@ -81,7 +84,7 @@ class HPatchesDataset(BaseDataset):
         sequences = sorted(sequences)
         self.sequences = sequences
         self.data_dir = data_dir
-        print(f"Loaded {len(sequences)} HPatches sequences "
+        logger.info(f"Loaded {len(sequences)} HPatches sequences "
               f"({conf.scene_type}, ignore_large={conf.ignore_large_scenes})")
 
     def get_dataset(self, _):
@@ -97,13 +100,27 @@ class _HPatchesDataset(torch.utils.data.Dataset):
         self.sequences = sequences
         self.data_dir = data_dir
 
+        # Apply max_scenes limit if configured (for fast eval)
+        max_scenes = conf.get("max_scenes")
+        if max_scenes is not None and len(sequences) > max_scenes:
+            # Select evenly distributed scenes for representative sampling
+            indices = np.linspace(0, len(sequences) - 1, max_scenes, dtype=int)
+            sequences = [sequences[i] for i in indices]
+            logger.info(f"Limited eval to {max_scenes} scenes: {sequences}")
+
         # Build list of all image pairs
         self.pairs = []
+        max_pairs = conf.get("max_pairs_per_scene")
+
         for seq in sequences:
             seq_dir = data_dir / seq
             is_illumination = seq.startswith("i_")
             # Find all image pairs (1 vs 2-6)
+            pair_count = 0
             for i in range(2, 7):
+                if max_pairs is not None and pair_count >= max_pairs:
+                    break
+
                 img1_path = seq_dir / "1.ppm"
                 img2_path = seq_dir / f"{i}.ppm"
                 H_path = seq_dir / f"H_1_{i}"
@@ -111,6 +128,7 @@ class _HPatchesDataset(torch.utils.data.Dataset):
                 if img1_path.exists() and img2_path.exists() and H_path.exists():
                     self.pairs.append((seq, img1_path, img2_path, H_path,
                                        is_illumination, i))
+                    pair_count += 1
 
     def __len__(self):
         return len(self.pairs)
@@ -150,8 +168,8 @@ class _HPatchesDataset(torch.utils.data.Dataset):
         img2 = (img2 - mean) / std
 
         return {
-            "view0": {"image": img1},
-            "view1": {"image": img2},
+            "image0": {"image": img1},
+            "image1": {"image": img2},
             "H_0to1": torch.from_numpy(H).float(),
             "seq_name": seq,
             "pair_idx": idx,

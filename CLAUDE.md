@@ -72,7 +72,7 @@ Training dataset with corner-based homography sampling:
 Evaluation dataset following SuperPoint/LoFTR protocol:
 - Supports `ignore_large_scenes` for fair comparison (excludes 8 extreme resolution scenes)
 - Scene types: `all`, `vantage` (v_*), `illumination` (i_*)
-- Returns: `view0`, `view1`, `H_0to1`, `seq_name`, `is_illumination`, `image_size`
+- Returns: `image0`, `image1`, `H_0to1`, `seq_name`, `is_illumination`, `image_size`
 
 ### Training (`train.py`)
 
@@ -143,6 +143,6 @@ This codebase adopts patterns from [glue-factory](https://github.com/cvg/glue-fa
 - **BaseModel/BaseDataset**: Unified interfaces with `default_conf`
 - **Factory functions**: `get_model()`, `get_dataset()` for dynamic loading
 - **Config-driven**: OmegaConf for all configuration
-- **Data format**: `{"view0": {"image": tensor}, "view1": {"image": tensor}, "H_0to1": tensor}`
+- **Data format**: `{"image0": {"image": tensor}, "image1": {"image": tensor}, "H_0to1": tensor}`
 
 Reference glue-factory code is in `thirdparty/glue-factory/` for consultation only - do not import directly.

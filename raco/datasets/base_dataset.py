@@ -37,6 +37,8 @@ class BaseDataset(metaclass=ABCMeta):
         "batch_size": 1,
         "num_workers": 4,
         "seed": 0,
+        "pin_memory": True,
+        "persistent_workers": False,
     }
     default_conf = {}
 
@@ -64,9 +66,15 @@ class BaseDataset(metaclass=ABCMeta):
         dataset = self.get_dataset(split)
         batch_size = self.conf.batch_size
         num_workers = self.conf.num_workers
+        pin_memory = self.conf.get("pin_memory", True)
+        persistent_workers = self.conf.get("persistent_workers", False)
 
         if shuffle is None:
             shuffle = split == "train"
+
+        # Persistent workers only when num_workers > 0
+        if persistent_workers and num_workers == 0:
+            persistent_workers = False
 
         return DataLoader(
             dataset,
@@ -74,6 +82,7 @@ class BaseDataset(metaclass=ABCMeta):
             shuffle=shuffle,
             num_workers=num_workers,
             collate_fn=collate,
-            pin_memory=True,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
             drop_last=(split == "train"),
         )

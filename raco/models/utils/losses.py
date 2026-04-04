@@ -10,6 +10,8 @@ class DetectorLoss(nn.Module):
     """
     Keypoint detector loss using policy gradient (Eq. 3 in paper).
     L_detector = -sum(rho' * log(pi))
+
+    Reference: "Learning Feature Descriptors using Deep Neural Networks"
     """
 
     def __init__(
@@ -26,26 +28,45 @@ class DetectorLoss(nn.Module):
         self.epsilon = epsilon
         self.step = 0
 
-    def compute_reward(self, reprojection_errors: torch.Tensor) -> torch.Tensor:
+    def compute_reward(self, reprojection_errors: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute reward based on reprojection error."""
-        rho_neg = -min(self.rho_neg_max, self.step * 1e-6)
+        # Dynamic negative reward: increases magnitude over training steps
+        rho_neg = -min(self.rho_neg_max, max(1e-6, self.step * 1e-7))
+
         rewards = torch.where(
             reprojection_errors <= self.d_max,
             torch.full_like(reprojection_errors, self.rho_pos),
             torch.full_like(reprojection_errors, rho_neg)
         )
+
+        # Apply mask: out-of-bounds pixels get 0 reward (no gradient)
+        if valid_mask is not None:
+            rewards = rewards * valid_mask.float()
+
         return rewards
 
     def normalize_reward(self, rewards: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Normalize reward: rho' = rho / (E[rho] + epsilon)."""
+        """
+        Normalize reward following DaD paper:
+        rho' = rho / (E[rho] + epsilon)
+
+        Args:
+            rewards: (B, N) tensor of rewards
+            valid_mask: (B, N) boolean tensor indicating valid keypoints
+
+        Returns:
+            normalized_rewards: (B, N) tensor
+        """
         if valid_mask is not None:
+            # Compute mean over valid keypoints only
             valid_rewards = rewards * valid_mask.float()
             reward_sum = valid_rewards.sum(dim=1, keepdim=True)
-            reward_count = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-            reward_mean = reward_sum / reward_count
+            valid_count = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+            reward_mean = reward_sum / valid_count
         else:
             reward_mean = rewards.mean(dim=1, keepdim=True)
 
+        # Add epsilon for numerical stability
         normalized_rewards = rewards / (reward_mean + self.epsilon)
         return normalized_rewards
 
@@ -56,10 +77,12 @@ class DetectorLoss(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute detector loss."""
-        rewards = self.compute_reward(reprojection_errors)
+        rewards = self.compute_reward(reprojection_errors, valid_mask)
         normalized_rewards = self.normalize_reward(rewards, valid_mask)
 
-        log_probs = torch.log(prob_map_flat + self.epsilon)
+        # Clamp prob_map to avoid log(0)
+        prob_map_clamped = prob_map_flat.clamp(min=self.epsilon, max=1.0)
+        log_probs = torch.log(prob_map_clamped)
         loss_per_loc = -normalized_rewards * log_probs
 
         if valid_mask is not None:
@@ -70,6 +93,64 @@ class DetectorLoss(nn.Module):
             loss = loss_per_loc.mean()
 
         return loss
+
+    def forward_sparse(
+        self,
+        prob_sparse: torch.Tensor,
+        reprojection_errors: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        Compute detector loss on sparse keypoints (following DaD).
+        This is more stable than dense loss over all pixels.
+
+        Args:
+            prob_sparse: (B, N) probability distribution over N keypoints (from softmax)
+            reprojection_errors: (B, N, 2, 1) or (B, N, 2) reprojection errors (dx, dy) for each keypoint
+            valid_mask: (B, N) boolean mask for valid keypoints
+        """
+        # Compute Euclidean distance from reprojection errors
+        # reprojection_errors: (B, N, 2, 1) -> squeeze to (B, N, 2)
+        if reprojection_errors.dim() == 4:
+            reprojection_errors = reprojection_errors.squeeze(-1)  # (B, N, 2)
+
+        # Compute distance: sqrt(dx^2 + dy^2)
+        distances = torch.norm(reprojection_errors, dim=-1)  # (B, N)
+
+        # Compute binary rewards based on distance threshold
+        rewards = torch.where(
+            distances <= self.d_max,
+            torch.full_like(distances, self.rho_pos),      # positive reward for inliers
+            torch.full_like(distances, -self.rho_pos)      # negative reward for outliers
+        )
+
+        # Apply valid mask
+        if valid_mask is not None:
+            rewards = rewards * valid_mask.float()
+
+        # Normalize rewards (per sample)
+        if valid_mask is not None:
+            valid_count = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+            reward_mean = (rewards * valid_mask.float()).sum(dim=1, keepdim=True) / valid_count
+        else:
+            reward_mean = rewards.mean(dim=1, keepdim=True)
+
+        normalized_rewards = rewards / (reward_mean + self.epsilon)
+
+        # Compute policy gradient loss
+        log_probs = torch.log(prob_sparse.clamp(min=self.epsilon))
+        loss = -(normalized_rewards * log_probs)
+
+        if valid_mask is not None:
+            loss = loss * valid_mask.float()
+            loss = loss.sum() / valid_mask.float().sum().clamp(min=1)
+        else:
+            loss = loss.mean()
+
+        return loss, {
+            "rewards": rewards,
+            "distances": distances,
+        }
 
     def set_step(self, step: int):
         """Update training step for dynamic rho_neg."""

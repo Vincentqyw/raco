@@ -24,6 +24,7 @@ from raco.datasets import get_dataset
 from raco.datasets.hpatches import IGNORED_SCENES
 from raco.geometry.homography import symmetric_homography_error
 from raco.models import get_model
+from raco.utils.tensorboard_vis import create_scene_logger, denormalize_image
 
 
 def find_matches(kpts0, kpts1, H_gt, threshold=3.0):
@@ -242,8 +243,8 @@ def visualize_pair(data, pred, matches, output_path):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        img0 = data['view0']['image'][0].cpu()
-        img1 = data['view1']['image'][0].cpu()
+        img0 = data['image0']['image'][0].cpu()
+        img1 = data['image1']['image'][0].cpu()
 
         # Denormalize
         mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -381,6 +382,9 @@ def main():
     scene_types = []
     vis_count = 0
 
+    # Create scene logger for enhanced visualization
+    scene_logger = create_scene_logger(writer)
+
     with torch.no_grad():
         for batch_idx, data in enumerate(tqdm(loader, desc="Evaluating")):
             # Move to device
@@ -400,27 +404,39 @@ def main():
             all_results.append(result)
             scene_types.append(data.get('is_illumination', [False])[0])
 
-            # Visualization
+            # Get sequence info
+            seq_name = data['seq_name'][0] if isinstance(data['seq_name'], list) else data['seq_name']
+            img_idx = data.get('img_idx', [1])[0] if isinstance(data.get('img_idx'), list) else data.get('img_idx', 1)
+
+            # Enhanced visualization using scene_logger for tracked scenes
+            if scene_logger.should_log_scene(seq_name):
+                # Prepare prediction dict
+                pred_formatted = {
+                    "image0": {
+                        "prob_map": pred.get("image0", {}).get("prob_map", None),
+                        "ranker_scores": pred.get("ranker_scores_0", None),
+                        "covariances": pred.get("covariances_0", None),
+                        "keypoints": pred.get("keypoints_0", None),
+                    },
+                    "keypoints_0": pred.get("keypoints_0"),
+                    "keypoint_scores_0": pred.get("keypoint_scores_0"),
+                }
+                try:
+                    scene_logger.log_scene_prediction(
+                        seq_name=seq_name,
+                        data=data,
+                        pred=pred_formatted,
+                        global_step=0,  # Single eval, use step 0
+                        img_idx=img_idx,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log scene {seq_name}: {e}")
+
+            # Traditional visualization for other scenes
             if vis_count < args.num_vis and len(matches) > 0:
-                seq_name = data['seq_name'][0] if isinstance(data['seq_name'], list) else data['seq_name']
                 vis_path = vis_dir / f"vis_{vis_count:03d}_{seq_name}.png"
                 visualize_pair(data, pred, matches, vis_path)
                 vis_count += 1
-
-                # Log images to tensorboard
-                if batch_idx < 5:
-                    seq_name = data['seq_name'][0] if isinstance(data['seq_name'], list) else data['seq_name']
-                    img0 = data['view0']['image'][0].cpu()
-                    writer.add_image(f"eval/{seq_name}/view0", img0, batch_idx)
-
-                    # Log additional visualizations if available
-                    if 'ranker_scores_0' in pred:
-                        scores = pred['ranker_scores_0'][0].cpu().numpy()
-                        fig, ax = plt.subplots()
-                        ax.hist(scores, bins=50)
-                        ax.set_title('Ranker Score Distribution')
-                        writer.add_figure(f"eval/{seq_name}/ranker_hist", fig, batch_idx)
-                        plt.close()
 
     # Aggregate metrics
     summary = aggregate_metrics(all_results, scene_types)

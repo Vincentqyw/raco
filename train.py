@@ -5,10 +5,12 @@ Follows glue-factory training pattern.
 """
 
 import argparse
+from datetime import datetime
 from pathlib import Path
-
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from loguru import logger
 from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
@@ -16,13 +18,27 @@ from tqdm import tqdm
 
 from raco.datasets import get_dataset
 from raco.models import get_model
-from raco.models.utils.losses import DetectorLoss
-from raco.geometry.homography import compute_reprojection_error_map
+from raco.models.utils.losses import DetectorLoss, RankingLoss, CovarianceLoss
+from raco.geometry.homography import transform_points_with_homography, compute_homography_jacobian
+from raco.utils.tensorboard_vis import create_scene_logger, EnhancedTensorBoardLogger
 
+# Mixed precision training
+try:
+    from torch.amp import autocast, GradScaler
+    AMP_AVAILABLE = True
+except ImportError:
+    try:
+        from torch.cuda.amp import autocast, GradScaler
+        AMP_AVAILABLE = True
+    except ImportError:
+        AMP_AVAILABLE = False
+
+def get_valid_mask(points, H_val, W_val):
+    return ((points[..., 0] >= 0) & (points[..., 0] < W_val) &
+            (points[..., 1] >= 0) & (points[..., 1] < H_val))
 
 def find_matches(kpts_a, kpts_b, H, threshold=3.0):
     """Find matches between keypoints using homography."""
-    from raco.geometry.homography import transform_points_with_homography
 
     kpts_a_in_b = transform_points_with_homography(
         kpts_a.unsqueeze(0), H.unsqueeze(0)
@@ -47,7 +63,7 @@ def find_matches(kpts_a, kpts_b, H, threshold=3.0):
            torch.tensor(matches_b, device=kpts_b.device)
 
 
-def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
+def run_eval(model, eval_loader, device, writer, global_step, num_vis=5, scene_logger=None):
     """Run evaluation and log to tensorboard."""
     model.eval()
     all_repeatability = []
@@ -55,6 +71,10 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
     vis_count = 0
 
     logger.info("Running evaluation...")
+
+    # Initialize scene logger if not provided
+    if scene_logger is None:
+        scene_logger = create_scene_logger(writer)
 
     with torch.no_grad():
         for batch_idx, data in enumerate(tqdm(eval_loader, desc="Eval", leave=False)):
@@ -67,7 +87,7 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
                 elif torch.is_tensor(data[key]):
                     data[key] = data[key].to(device)
 
-            pred = model(data)
+            pred = model.forward_dual(data)
 
             # Compute metrics
             kpts0 = pred['keypoints_0'][0]
@@ -79,7 +99,6 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
 
             # Repeatability: fraction of keypoints with match < 3px
             if len(kpts0) > 0:
-                from raco.geometry.homography import transform_points_with_homography
                 kpts0_proj = transform_points_with_homography(
                     kpts0.unsqueeze(0), H_gt.unsqueeze(0)
                 ).squeeze(0)
@@ -95,14 +114,40 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
                 matching_score = num_matches / (len(kpts0) + len(kpts1))
                 all_matching_scores.append(matching_score)
 
-            # Log visualizations
-            if vis_count < num_vis and num_matches > 0:
+            # Log scene-specific visualizations using enhanced logger
+            seq_name = data.get('seq_name', ['unknown'])[0] if isinstance(data.get('seq_name'), list) else data.get('seq_name', 'unknown')
+            img_idx = data.get('img_idx', [0])[0] if isinstance(data.get('img_idx'), list) else data.get('img_idx', 0)
+
+            # Use enhanced logging for tracked scenes
+            if scene_logger.should_log_scene(seq_name):
+                # Prepare prediction dict in format expected by logger
+                pred_formatted = {
+                    "image0": {
+                        "prob_map": pred.get("image0", {}).get("prob_map", None),
+                        "ranker_scores": pred.get("ranker_scores_0", None),
+                        "covariances": pred.get("covariances_0", None),
+                        "keypoints": pred.get("keypoints_0", None),
+                    },
+                    "keypoints_0": pred.get("keypoints_0"),
+                    "keypoint_scores_0": pred.get("keypoint_scores_0"),
+                }
                 try:
-                    img0 = data['view0']['image'][0]
-                    # Denormalize
-                    mean = torch.tensor([0.485, 0.456, 0.406], device=img0.device).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225], device=img0.device).view(3, 1, 1)
-                    img0_vis = (img0 * std + mean).clamp(0, 1)
+                    scene_logger.log_scene_prediction(
+                        seq_name=seq_name,
+                        data=data,
+                        pred=pred_formatted,
+                        global_step=global_step,
+                        img_idx=img_idx,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log scene {seq_name}: {e}")
+
+            # Fallback: Log basic visualizations for non-tracked scenes
+            elif vis_count < num_vis and num_matches > 0:
+                try:
+                    from raco.utils.tensorboard_vis import denormalize_image
+                    img0 = data['image0']['image'][0]
+                    img0_vis = denormalize_image(img0)
                     writer.add_image(f"eval/pair_{vis_count}/image", img0_vis, global_step)
 
                     # Log heatmap of keypoint scores
@@ -110,7 +155,7 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
                     writer.add_histogram(f"eval/pair_{vis_count}/scores", scores, global_step)
 
                     vis_count += 1
-                except Exception as e:
+                except Exception:
                     pass
 
     # Log metrics
@@ -126,7 +171,39 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5):
     return {"repeatability": mean_rep, "matching_score": mean_ms}
 
 
-def train_model(model, train_loader, eval_loader, device, conf, writer, start_iter=0):
+def set_stage_require_grad(model, stage):
+    """Set requires_grad for parameters based on training stage.
+
+    Detector params: encoder (block1-4, conv1-4, pool2, pool4, gate) + score_head
+    Ranker params: ranker_head
+    Covariance params: covariance_estimator_head
+    """
+    detector_names = [
+        "block1", "block2", "block3", "block4",
+        "conv1", "conv2", "conv3", "conv4",
+        "pool2", "pool4", "gate", "normalizer",
+        "score_head"
+    ]
+
+    for name, param in model.named_parameters():
+        if stage == "detector":
+            # Train everything
+            param.requires_grad = True
+        elif stage == "ranker":
+            # Only ranker_head
+            param.requires_grad = "ranker_head" in name
+        elif stage == "covariance":
+            # Only covariance_estimator_head
+            param.requires_grad = ("covariance_estimator_head" in name) or ("var_activation" in name)
+        else:
+            param.requires_grad = False
+
+    # Log which parameters are trainable
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    logger.info(f"Stage '{stage}' - Trainable params: {trainable}")
+
+
+def train_model(model, train_loader, eval_loader, device, conf, writer, start_iter=0, scene_logger=None):
     """Training loop with eval."""
     stage = conf.train.stage
     max_steps = {
@@ -139,22 +216,39 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
     save_interval = conf.train.save_interval
     eval_interval = conf.train.get("eval_interval", 5000)
 
-    # Initialize loss
+    # Mixed precision training setup
+    use_amp = conf.train.get("use_amp", True) and AMP_AVAILABLE and device.type == "cuda"
+    if use_amp:
+        # PyTorch 2.0+ uses device-specific GradScaler
+        try:
+            scaler = GradScaler(device='cuda')
+        except TypeError:
+            # Fallback for older PyTorch versions
+            scaler = GradScaler()
+        logger.info("Using mixed precision training (AMP)")
+    else:
+        scaler = None
+
+    # Initialize loss functions
     det_loss_fn = None
+    rank_loss_fn = None
+    cov_loss_fn = None
+
     if stage == "detector":
         det_loss_fn = DetectorLoss(
             d_max=conf.model.detector.d_max,
             rho_pos=conf.model.detector.rho_pos,
             rho_neg_max=conf.model.detector.rho_neg_max,
         )
+    elif stage == "ranker":
+        rank_loss_fn = RankingLoss(
+            lambda_ranker=conf.model.ranker.get("lambda_ranker", 1.0),
+        )
+    elif stage == "covariance":
+        cov_loss_fn = CovarianceLoss()
 
-    # Freeze parameters
-    for name, param in model.named_parameters():
-        param.requires_grad = {
-            "detector": True,
-            "ranker": "ranker" in name,
-            "covariance": "covariance" in name,
-        }[stage]
+    # Freeze parameters based on stage
+    set_stage_require_grad(model, stage)
 
     # Optimizer
     params = [p for n, p in model.named_parameters() if p.requires_grad]
@@ -176,49 +270,175 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                 if isinstance(batch[key], dict):
                     for k in batch[key]:
                         if torch.is_tensor(batch[key][k]):
-                            batch[key][k] = batch[key][k].to(device)
+                            batch[key][k] = batch[key][k].to(device, non_blocking=True)
                 elif torch.is_tensor(batch[key]):
-                    batch[key] = batch[key].to(device)
+                    batch[key] = batch[key].to(device, non_blocking=True)
 
-            pred = model(batch)
+            # Mixed precision forward pass
+            with autocast(device_type=device.type, enabled=use_amp):
+                pred = model.forward_dual(batch)
 
-            # Compute loss
-            if stage == "detector":
-                B, _, H, W = pred["view0"]["raw_scores"].shape
+                # Pre compute reprojection error
+                B, _, H, W = pred["image0"]["raw_scores"].shape
+                kpts0 = pred["keypoints_0"]  # (B, N, 2)
+                kpts1 = pred["keypoints_1"]
                 H_0to1 = batch["H_0to1"]
 
-                errors_a = compute_reprojection_error_map(
-                    (B, 1, H, W), H_0to1, device
-                )
-                errors_b = compute_reprojection_error_map(
-                    (B, 1, H, W), torch.inverse(H_0to1), device
-                )
+                # Transform keypoints
+                kpts0_in_1 = transform_points_with_homography(kpts0, H_0to1)
+                kpts1_in_0 = transform_points_with_homography(kpts1, torch.inverse(H_0to1))
 
-                prob_flat_a = torch.softmax(pred["view0"]["raw_scores"].flatten(1), dim=1)
-                prob_flat_b = torch.softmax(pred["view1"]["raw_scores"].flatten(1), dim=1)
+                # Compute reprojection errors
+                errors_0_to_1 = (kpts0_in_1 - kpts1).unsqueeze(-1)  # (B, N, 2, 1)
+                errors_1_to_0 = (kpts1_in_0 - kpts0).unsqueeze(-1)
 
-                loss_a = det_loss_fn(prob_flat_a, errors_a)
-                loss_b = det_loss_fn(prob_flat_b, errors_b)
-                loss = (loss_a + loss_b) / 2
+                valid_0_to_1 = get_valid_mask(kpts0_in_1, H, W)
+                valid_1_to_0 = get_valid_mask(kpts1_in_0, H, W)
 
-                det_loss_fn.set_step(iteration)
-            else:
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
+                # Compute loss based on stage
+                if stage == "detector":
+                    # Check if keypoints are in valid region after transformation
+                    prob_0_sparse = pred["image0"]["keypoint_scores"]
+                    prob_1_sparse = pred["image1"]["keypoint_scores"]
 
+                    # Compute loss on sparse samples
+                    loss_0, loss_0_details = det_loss_fn.forward_sparse(prob_0_sparse, errors_0_to_1, valid_0_to_1)
+                    loss_1, loss_1_details = det_loss_fn.forward_sparse(prob_1_sparse, errors_1_to_0, valid_1_to_0)
+                    loss = (loss_0 + loss_1) / 2.0
+                    
+                    detector_loss_0_rewards = loss_0_details['rewards']
+                    detector_loss_1_rewards = loss_1_details['rewards']
+
+                    # Debug: check if loss is 0 and why
+                    if loss.item() == 0 and iteration % 10 == 0:
+                        logger.warning(
+                            f"Loss is 0! valid_ratio={valid_0_to_1.float().mean():.3f}, "
+                            f"prob_mean={prob_0_sparse.mean():.6f}, "
+                            f"errors_mean={errors_0_to_1.mean():.3f}"
+                        )
+
+                    det_loss_fn.set_step(iteration)
+
+                elif stage == "ranker":
+                    # Ranking loss using soft ranking
+
+                    ranker_scores_0 = pred["ranker_scores_0"]  # (B, N)
+                    ranker_scores_1 = pred["ranker_scores_1"]
+                    # Find matches for ranking
+                    distances = torch.cdist(kpts0_in_1, kpts1)
+
+                    # Mutual nearest neighbors
+                    min_dist_0to1, matches_0to1 = distances.min(dim=2)
+                    _, matches_1to0 = distances.min(dim=1)
+
+                    matches_a = []
+                    matches_b = []
+                    for b in range(B):
+                        valid_matches = []
+                        for i in range(kpts0.shape[1]):
+                            j = matches_0to1[b, i]
+                            if matches_1to0[b, j] == i and min_dist_0to1[b, i] < 3.0:
+                                valid_matches.append((i, j))
+                        if valid_matches:
+                            ma, mb = zip(*valid_matches)
+                            matches_a.append(torch.tensor(ma, device=device))
+                            matches_b.append(torch.tensor(mb, device=device))
+                        else:
+                            matches_a.append(torch.tensor([], device=device, dtype=torch.long))
+                            matches_b.append(torch.tensor([], device=device, dtype=torch.long))
+
+                    # Pad to same length for batching
+                    max_matches = max(len(m) for m in matches_a) if matches_a else 0
+                    if max_matches > 0:
+                        matches_a_padded = torch.full((B, max_matches), -1, device=device, dtype=torch.long)
+                        matches_b_padded = torch.full((B, max_matches), -1, device=device, dtype=torch.long)
+                        for b in range(B):
+                            n = len(matches_a[b])
+                            if n > 0:
+                                matches_a_padded[b, :n] = matches_a[b]
+                                matches_b_padded[b, :n] = matches_b[b]
+                    else:
+                        matches_a_padded = torch.full((B, 1), -1, device=device, dtype=torch.long)
+                        matches_b_padded = torch.full((B, 1), -1, device=device, dtype=torch.long)
+
+                    loss, _ = rank_loss_fn(
+                        ranker_scores_0, ranker_scores_1,
+                        matches_a_padded, matches_b_padded,
+                    )
+
+                elif stage == "covariance":
+                    # Covariance loss using reprojection error
+                    covariances_0 = pred["covariances_0"]  # (B, N, 2, 2)
+                    covariances_1 = pred["covariances_1"]
+
+                    # Compute Jacobians
+                    jacobian_0_to_1 = compute_homography_jacobian(H_0to1, kpts0)
+                    jacobian_1_to_0 = compute_homography_jacobian(torch.inverse(H_0to1), kpts1)
+
+                    # Compute bidirectional loss
+                    loss, _ = cov_loss_fn.forward_bidirectional(
+                        covariances_0, covariances_1,
+                        errors_0_to_1, errors_1_to_0,
+                        jacobian_0_to_1, jacobian_1_to_0,
+                    )
+
+                else:
+                    loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+            # Backward with mixed precision
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            # Step scheduler AFTER optimizer (PyTorch best practice)
             scheduler.step()
 
-            # Logging
+            # Logging with more debug info
             if iteration % log_interval == 0:
                 writer.add_scalar(f"{stage}/loss", loss.item(), iteration)
                 writer.add_scalar(f"{stage}/lr", scheduler.get_last_lr()[0], iteration)
 
+                # Debug: log detector-specific statistics
+                if stage == "detector":
+                    writer.add_scalar(f"{stage}/reward_0_mean", detector_loss_0_rewards.mean().item(), iteration)
+                    writer.add_scalar(f"{stage}/reward_0_std", detector_loss_0_rewards.std().item(), iteration)
+                    writer.add_scalar(f"{stage}/reward_1_std", detector_loss_1_rewards.std().item(), iteration)
+                    writer.add_scalar(f"{stage}/reward_1_std", detector_loss_1_rewards.std().item(), iteration)
+                    writer.add_scalar(f"{stage}/valid_ratio", valid_0_to_1.float().mean().item(), iteration)
+
+                # Debug: log gradient norms every 500 iterations
+                if stage == "detector" and iteration % 500 == 0:
+                    total_norm = 0.0
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            param_norm = param.grad.data.norm(2).item()
+                            total_norm += param_norm ** 2
+                            # Log score_head gradients specifically
+                            if "score_head" in name:
+                                writer.add_scalar(f"gradients/score_head_{name}", param_norm, iteration)
+                    total_norm = total_norm ** 0.5
+                    writer.add_scalar(f"gradients/total_norm", total_norm, iteration)
+
             iteration += 1
             pbar.update(1)
-            pbar.set_postfix({"step": iteration, "loss": f"{loss.item():.4f}"})
+
+            # Build postfix based on stage
+            postfix = {"loss": f"{loss.item():.4f}"}
+            if stage == "detector":
+                postfix["N"] = prob_0_sparse.shape[1]
+                postfix["sum"] = f"{prob_0_sparse.sum(dim=1).mean():.3f}"
+                postfix["max"] = f"{prob_0_sparse.max():.4f}"
+                postfix["nz"] = f"{(prob_0_sparse > 1e-6).sum(dim=1).float().mean():.0f}"
+
+            pbar.set_postfix(postfix)
 
             # Save checkpoint
             if iteration % save_interval == 0:
@@ -228,7 +448,7 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
 
             # Evaluation
             if eval_loader is not None and iteration % eval_interval == 0:
-                run_eval(model, eval_loader, device, writer, iteration)
+                run_eval(model, eval_loader, device, writer, iteration, scene_logger=scene_logger)
 
             if iteration >= max_steps:
                 break
@@ -253,9 +473,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    # Create output dir
-    output_dir = Path(conf.output.output_dir)
+    # Create output dir with timestamp subfolder
+    base_output_dir = Path(conf.output.output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = base_output_dir / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
+    conf.output.output_dir = output_dir  # update
+    logger.info(f"Output directory: {output_dir}")
 
     # Save config
     with open(output_dir / "config.yaml", "w") as f:
@@ -264,8 +488,16 @@ def main():
     # TensorBoard
     writer = SummaryWriter(output_dir / "tb_logs")
 
+    # Create scene logger for tracking specific HPatches scenes
+    scene_logger = create_scene_logger(writer, tracked_scenes=["i_ajuntament", "v_adam"])
+
     # Load model
     model = get_model(conf.model.name)(conf.model).to(device)
+
+    # Compile model for faster training (PyTorch 2.0+)
+    if conf.train.get("compile", False) and hasattr(torch, "compile"):
+        logger.info("Compiling model with torch.compile()")
+        model = torch.compile(model)
 
     if args.resume:
         logger.info(f"Loading checkpoint from {args.resume}")
@@ -283,8 +515,10 @@ def main():
             eval_conf = OmegaConf.create({
                 "data_dir": "/mnt/e/datasets/hpatches-sequences-release",
                 "scene_type": "all",
-                "batch_size": 1,
-                "num_workers": 2,
+                "batch_size": conf.eval.get("batch_size", 1),
+                "num_workers": conf.eval.get("num_workers", 2),
+                "max_scenes": conf.eval.get("max_scenes", None),
+                "max_pairs_per_scene": conf.eval.get("max_pairs_per_scene", None),
             })
             eval_dataset = get_dataset("hpatches")(eval_conf)
             eval_loader = eval_dataset.get_data_loader("test", shuffle=False)
@@ -297,19 +531,21 @@ def main():
 
     # Run eval only
     if args.eval_only and eval_loader is not None:
-        run_eval(model, eval_loader, device, writer, 0, num_vis=10)
+        run_eval(model, eval_loader, device, writer, 0, num_vis=10, scene_logger=scene_logger)
         writer.close()
         return
 
     # Train
     start_iter = 0
-    stages = ["detector", "ranker", "covariance"] if args.stage == "all" else [args.stage]
+    if args.stage == "all":
+        stages = ["detector", "ranker", "covariance"]
+    else:
+        stages = [args.stage]
 
     for stage in stages:
         conf.train.stage = stage
-        start_iter = train_model(model, train_loader, eval_loader, device, conf, writer, start_iter)
+        start_iter = train_model(model, train_loader, eval_loader, device, conf, writer, start_iter, scene_logger)
 
-        # Save checkpoint
         ckpt_path = output_dir / f"{stage}_final.pth"
         torch.save(model.state_dict(), ckpt_path)
         logger.info(f"Saved {stage} checkpoint to {ckpt_path}")

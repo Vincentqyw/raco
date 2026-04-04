@@ -239,7 +239,7 @@ class ImagePreprocessor:
         transform = np.diag([scale[0], scale[1], 1.0])
 
         return {
-            "image": img,
+            "image": img,  # RGB
             "image_size": np.array([size[1], size[0]]),  # (W, H)
             "transform": transform,
             "original_image_size": np.array([w, h]),  # (W, H)
@@ -441,11 +441,11 @@ class _Dataset(torch.utils.data.Dataset):
         H_tensor = torch.from_numpy(H).float()
 
         return {
-            "view0": {
+            "image0": {
                 "image": img_tensor,
                 "original_image_size": data0["original_image_size"],
             },
-            "view1": {
+            "image1": {
                 "image": img_warped_tensor,
                 "original_image_size": data0["original_image_size"],
             },

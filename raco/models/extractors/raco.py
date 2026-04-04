@@ -4,8 +4,11 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import torchvision.transforms as transforms
+from typing import Optional
+from loguru import logger
 from ..base_model import BaseModel
+from ...utils.utils import ImagePreprocessor
 
 
 def conv1x1(in_planes, out_planes, stride=1, bias=False):
@@ -146,6 +149,8 @@ class RaCo(BaseModel):
         "ranker": True,
         "covariance_estimator": True,
         "sort_by_ranker": False,
+        "remove_borders": True,  # Remove keypoints near borders (following DaD)
+        "border_size": 4,  # Border size in pixels to remove
         "detector": {
             "d_max": 1.2,
             "rho_pos": 1.0,
@@ -154,15 +159,18 @@ class RaCo(BaseModel):
         "ranker": {
             "lambda_ranker": 1.0,
         },
+        "weights": None,
     }
-    required_data_keys = ["view0", "view1"]
+    preprocess_conf = {
+        "resize": None,
+    }
+    required_data_keys = ["image0", "image1"]
     strict_conf = False
 
     def _init(self, conf):
         # Normalization
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
+        self.normalizer = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet normalization
+    
         # Architecture
         self.pool2 = nn.AvgPool2d(2, 2)
         self.pool4 = nn.AvgPool2d(4, 4)
@@ -188,7 +196,7 @@ class RaCo(BaseModel):
         )
 
         # Ranker head
-        if conf.use_ranker:
+        if conf.ranker:
             ranker_dim = 12
             ranker_layers = [ResBlock(3, ranker_dim)]
             ranker_layers += [ResBlock(ranker_dim, ranker_dim) for _ in range(8)]
@@ -196,7 +204,7 @@ class RaCo(BaseModel):
             self.ranker_head = nn.Sequential(*ranker_layers)
 
         # Covariance head
-        if conf.use_covariance:
+        if conf.covariance_estimator:
             cov_modules = []
             in_ch = c4
             for out_ch in [64, 32, 32]:
@@ -204,24 +212,39 @@ class RaCo(BaseModel):
                 cov_modules.append(nn.LeakyReLU(inplace=True))
                 in_ch = out_ch
             cov_modules.append(nn.Conv2d(32, 3, 1, bias=True, padding_mode="reflect"))
-            self.covariance_head = nn.Sequential(*cov_modules)
-            self.cov_activation = nn.Softplus()
+            self.covariance_estimator_head = nn.Sequential(*cov_modules)
+            self.var_activation = nn.Softplus()
 
-    def _normalize(self, image):
-        return (image - self.mean) / self.std
+        if self.conf.weights is not None:
+            # Load pretrained weights from URL or local path
+            if isinstance(self.conf.weights, str) and self.conf.weights.startswith(
+                ("http://", "https://")
+            ):
+                state_dict = torch.hub.load_state_dict_from_url(
+                    self.conf.weights,
+                    map_location="cpu",
+                    progress=True,
+                    weights_only=True,
+                )
+            else:
+                state_dict = torch.load(
+                    self.conf.weights, map_location="cpu", weights_only=True
+                )
 
-    def _forward(self, data):
+            self.load_state_dict(state_dict, strict=False)
+            logger.info(f"[RaCo] Loaded weights from {self.conf.weights}")
+        else:
+            logger.warning(f"[RaCo] weight is None")
+
+
+    def forward_dual(self, data):
         """Forward pass returning predictions."""
         pred = {}
 
-        for i, view_key in enumerate(["view0", "view1"]):
-            view = data[view_key]
-            image = view["image"]
-            if image.shape[1] == 1:
-                image = image.repeat(1, 3, 1, 1)
-
+        for i, view_key in enumerate(["image0", "image1"]):
+            view = data[view_key]  # key: image
             # Extract features
-            features = self._extract_features(image)
+            features = self._forward(view)
             pred[view_key] = features
 
             # Rename for convenience
@@ -234,9 +257,19 @@ class RaCo(BaseModel):
 
         return pred
 
-    def _extract_features(self, image):
+
+    def _forward(self, data: dict) -> dict:
+        # Preprocess image
+        image = data["image"]
+        return self.forward_single(image)
+
+
+    def forward_single(self, image):
         """Extract features from a single image."""
-        image = self._normalize(image)
+        # Preprocess image
+        if image.shape[1] == 1:
+            image = image.repeat(1, 3, 1, 1)  # Convert to 3-channel greyscale
+        image = self.normalizer(image)  # (x-mean) / std
 
         # Pad to divisible by 32
         div_by = 2**5
@@ -259,26 +292,42 @@ class RaCo(BaseModel):
         x4_up = F.interpolate(self.gate(self.conv4(x4)), scale_factor=32, mode="bilinear", align_corners=True)
         x_fused = torch.cat([x1_up, x2_up, x3_up, x4_up], dim=1)
 
-        # Score head
+        # Score head - output logits (not probabilities)
         raw_scores = self.score_head(x_fused)
         raw_scores = padder.unpad(raw_scores)
 
-        # Probability map (global softmax)
+        # Probability map (global softmax for visualization and sampling)
         B, _, H, W = raw_scores.shape
-        prob_map = F.softmax(raw_scores.flatten(1), dim=1).reshape(raw_scores.shape)
+        prob_map = F.softmax(raw_scores.flatten(1), dim=1).reshape(raw_scores.size())
 
-        # Sample keypoints
-        kpts, scores_dict = self._sample_keypoints(prob_map, raw_scores, H, W)
+        # Debug: log probability distribution statistics during training
+        if self.training and B > 0:
+            # Check if prob_map is too flat or too sharp
+            prob_max = prob_map.max()
+            prob_min = prob_map.min()
+            prob_entropy = -(prob_map * torch.log(prob_map + 1e-8)).sum() / B
+            # Store for logging (can be accessed externally)
+            self._debug_prob_stats = {
+                "prob_max": prob_max.item(),
+                "prob_min": prob_min.item(),
+                "prob_entropy": prob_entropy.item(),
+                "prob_mean": prob_map.mean().item(),
+                "raw_scores_std": raw_scores.std().item(),
+            }
+
+        kpts = self._sample_keypoints(prob_map, raw_scores)
+
+        probs = _sample_at_positions(prob_map, kpts, H, W, self.conf.subpixel_sampling)  # (B, N)
 
         result = {
-            "raw_scores": raw_scores,
-            "prob_map": prob_map,
+            "raw_scores": raw_scores,  # Logits for loss computation
+            "prob_map": prob_map,  # Softmax probabilities for visualization
             "keypoints": kpts,
-            "keypoint_scores": scores_dict["detection_scores"],
+            "keypoint_scores": probs,
         }
 
         # Ranker
-        if self.conf.use_ranker:
+        if self.conf.ranker:
             ranker_feat = self.ranker_head(x)
             ranker_feat = padder.unpad(ranker_feat)
             ranker_scores = _sample_at_positions(
@@ -287,13 +336,13 @@ class RaCo(BaseModel):
             result["ranker_scores"] = ranker_scores
 
         # Covariance
-        if self.conf.use_covariance:
-            cov_feat = self.covariance_head(x_fused)
+        if self.conf.covariance_estimator:
+            cov_feat = self.covariance_estimator_head(x_fused)
             cov_feat = padder.unpad(cov_feat)
             cov_feat = torch.stack([
-                self.cov_activation(cov_feat[:, 0]),
+                self.var_activation(cov_feat[:, 0]),
                 cov_feat[:, 1],
-                self.cov_activation(cov_feat[:, 2]),
+                self.var_activation(cov_feat[:, 2]),
             ], dim=1)
             cov_values = _sample_at_positions(
                 cov_feat, kpts, H, W, self.conf.subpixel_sampling
@@ -315,34 +364,86 @@ class RaCo(BaseModel):
 
         return result
 
-    def _sample_keypoints(self, prob_map, raw_scores, H, W):
-        """Sample keypoints from probability map."""
-        B = prob_map.shape[0]
+
+    @torch.no_grad()
+    def extract(self, img: torch.Tensor, **conf) -> dict:
+        """Perform extraction with online resizing.
+
+        Args:
+            img: Input image tensor of shape (C, H, W) or (B, C, H, W)
+            **conf: Additional preprocessing configuration (e.g., resize settings)
+
+        Returns:
+            Dictionary containing extracted features with scaled coordinates
+        """
+        if img.dim() == 3:
+            img = img[None]  # add batch dim
+        assert img.dim() == 4 and img.shape[0] == 1
+        shape = img.shape[-2:][::-1]
+        img, scales = ImagePreprocessor(**{**self.preprocess_conf, **conf})(img)
+        feats = self.forward_single(img)
+        feats["image_size"] = torch.tensor(shape)[None].to(img).float()
+        feats["keypoints"] = feats["keypoints"] / scales[None]
+
+        # Scale covariances if present
+        if "covariances" in feats:
+            scales_mat = torch.diag(scales).to(img)
+            feats["covariances"] = (
+                scales_mat[None]
+                @ feats["covariances"]
+                @ scales_mat[None].transpose(-1, -2)
+            )
+        return feats
+
+    def _sample_keypoints(self, prob_map, raw_scores: Optional[torch.Tensor] = None):
+        """Sample keypoints from probability map with NMS."""
+        # B = prob_map.shape[0]
+        B, C, H, W = prob_map.size()
         num_kpts = min(self.conf.max_num_keypoints, H * W)
         nms_radius = self.conf.nms_radius
 
-        # NMS
-        max_pooled = F.max_pool2d(prob_map, nms_radius, stride=1, padding=nms_radius // 2)
-        prob_nms = prob_map * (prob_map == max_pooled)
+        # Remove borders (following DaD)
+        if self.conf.remove_borders:
+            border = self.conf.border_size
+            prob_map_masked = prob_map.clone()
+            prob_map_masked[..., :border, :] = 0  # Top border
+            prob_map_masked[..., -border:, :] = 0  # Bottom border
+            prob_map_masked[..., :, :border] = 0  # Left border
+            prob_map_masked[..., :, -border:] = 0  # Right border
+        else:
+            prob_map_masked = prob_map
 
-        # Top-k
+        # NMS: keep only local maxima
+        # Use max_pool2d to find local maxima in each nms_radius x nms_radius window
+        # Use kernel_size=nms_radius (3) not 2*radius+1 to match DAD's nms_size=3
+        max_pooled = F.max_pool2d(
+            prob_map_masked,
+            kernel_size=nms_radius,
+            stride=1,
+            padding=nms_radius // 2
+        )
+        # A pixel is a local maximum if it's equal to the max in its neighborhood
+        is_local_max = (prob_map_masked == max_pooled)
+        prob_nms = prob_map_masked * is_local_max.float()
+
+        # Top-k: select topk keypoints from NMS-suppressed map
         prob_flat = prob_nms.reshape(B, H * W)
         topk = torch.topk(prob_flat, k=num_kpts, dim=1)
 
         hw_inds = topk.indices
         h_inds = hw_inds // W
         w_inds = hw_inds % W
-        kpts = torch.stack([w_inds.float(), h_inds.float()], dim=-1)
+        kpts = torch.stack([w_inds.float(), h_inds.float()], dim=-1)   # (B, num_kpts, 2)
 
         # Subpixel refinement
-        if self.conf.subpixel_sampling:
+        if self.conf.subpixel_sampling and raw_scores is not None:
             offsets = _compute_subpixel_offsets(raw_scores, hw_inds, nms_radius, self.conf.subpixel_temp)
             kpts = kpts + offsets
 
         # Get scores at keypoints
         scores = topk.values
 
-        return kpts + 0.5, {"detection_scores": scores}
+        return kpts + 0.5 #, {"detection_scores": scores}
 
     def loss(self, pred, data):
         """Compute losses - to be implemented with proper loss functions."""
