@@ -225,7 +225,7 @@ class EnhancedTensorBoardLogger:
             num_scenes_per_eval: Number of scenes to visualize per eval
         """
         self.writer = writer
-        self.tracked_scenes = tracked_scenes or DEFAULT_TRACKED_SCENES
+        self.tracked_scenes = tracked_scenes # or DEFAULT_TRACKED_SCENES
         self.num_scenes_per_eval = num_scenes_per_eval
 
         # Store predictions for tracked scenes to enable step-by-step comparison
@@ -233,7 +233,10 @@ class EnhancedTensorBoardLogger:
 
     def should_log_scene(self, seq_name: str) -> bool:
         """Check if a scene should be logged."""
-        return seq_name in self.tracked_scenes
+        if self.tracked_scenes is not None:
+            return seq_name in self.tracked_scenes
+        else:
+            return True
 
     def log_scene_prediction(
         self,
@@ -256,7 +259,7 @@ class EnhancedTensorBoardLogger:
         if not self.should_log_scene(seq_name):
             return
 
-        tag_prefix = f"scenes/{seq_name}/{img_idx}"
+        tag_prefix = f"scenes/{seq_name}/{img_idx.item()}"
 
         # 1. Log RGB image
         img0 = data["image0"]["image"][0]  # [3, H, W]
@@ -337,7 +340,12 @@ class EnhancedTensorBoardLogger:
 
         # 5. Log keypoints overlay
         keypoints = pred["keypoints_0"][0]  # [N, 2]
-        scores = pred.get("keypoint_scores_0", [None])[0] if "keypoint_scores_0" in pred else None
+        if "keypoint_scores_0" in pred:
+            scores = pred["keypoint_scores_0"][0]  # [N]
+            if isinstance(scores, torch.Tensor):
+                scores = scores.cpu()
+        else:
+            scores = None
 
         kpts_fig = create_keypoints_overlay_figure(
             img0,

@@ -110,12 +110,24 @@ class DetectorLoss(nn.Module):
             valid_mask: (B, N) boolean mask for valid keypoints
         """
         # Compute Euclidean distance from reprojection errors
-        # reprojection_errors: (B, N, 2, 1) -> squeeze to (B, N, 2)
-        if reprojection_errors.dim() == 4:
+        # Supports multiple input formats:
+        # - (B, N): already computed distances
+        # - (B, N, 2): 2D error vectors
+        # - (B, N, 2, 1): 2D error vectors with extra dim
+        if reprojection_errors.dim() == 1:
+            # Already 1D distances (B * N flattened or single batch)
+            distances = reprojection_errors
+        elif reprojection_errors.dim() == 2:
+            # Already 2D (B, N) - distances already computed
+            distances = reprojection_errors
+        elif reprojection_errors.dim() == 4:
             reprojection_errors = reprojection_errors.squeeze(-1)  # (B, N, 2)
-
-        # Compute distance: sqrt(dx^2 + dy^2)
-        distances = torch.norm(reprojection_errors, dim=-1)  # (B, N)
+            distances = torch.norm(reprojection_errors, dim=-1)  # (B, N)
+        elif reprojection_errors.dim() == 3:
+            # (B, N, 2) error vectors
+            distances = torch.norm(reprojection_errors, dim=-1)  # (B, N)
+        else:
+            raise ValueError(f"Unexpected reprojection_errors dim: {reprojection_errors.dim()}")
 
         # Compute binary rewards based on distance threshold
         rewards = torch.where(
@@ -127,6 +139,15 @@ class DetectorLoss(nn.Module):
         # Apply valid mask
         if valid_mask is not None:
             rewards = rewards * valid_mask.float()
+
+        # Early exit: if no valid keypoints, return zero loss with requires_grad
+        if valid_mask is not None:
+            valid_count = valid_mask.float().sum().item()
+            if valid_count == 0:
+                return torch.tensor(0.0, device=prob_sparse.device, requires_grad=True), {
+                    "rewards": rewards,
+                    "distances": distances,
+                }
 
         # Normalize rewards (per sample)
         if valid_mask is not None:
@@ -219,34 +240,56 @@ class RankingLoss(nn.Module):
         soft_ranks_a_norm = (soft_ranks_a - 1) / (N - 1 + 1e-8)
         soft_ranks_b_norm = (soft_ranks_b - 1) / (N - 1 + 1e-8)
 
-        # Spearman Loss
+        # Spearman Loss: Eq. 4 in paper
+        # Lspearman = (1/N) * Σ (hsoft(rmatched_A,i) - hsoft(rmatched_B,i))^2
+        # We normalize by number of matches
         spearman_loss = 0.0
         num_matches = matches_a.shape[1]
+        total_valid_matches = 0
         if num_matches > 0:
             for b in range(B):
-                matched_ranks_a = soft_ranks_a_norm[b, matches_a[b]]
-                matched_ranks_b = soft_ranks_b_norm[b, matches_b[b]]
+                # Filter out -1 (padding)
+                valid_mask = matches_a[b] >= 0
+                if valid_mask.sum() == 0:
+                    continue
+                matched_idx_a = matches_a[b][valid_mask]
+                matched_idx_b = matches_b[b][valid_mask]
+                matched_ranks_a = soft_ranks_a_norm[b, matched_idx_a]
+                matched_ranks_b = soft_ranks_b_norm[b, matched_idx_b]
                 if len(matched_ranks_a) > 0:
                     spearman_loss = spearman_loss + F.mse_loss(matched_ranks_a, matched_ranks_b)
-            spearman_loss = spearman_loss / B
+                    total_valid_matches += len(matched_ranks_a)
+            # Normalize by total matches across batch (matching paper's 1/N)
+            if total_valid_matches > 0:
+                spearman_loss = spearman_loss / total_valid_matches
+            else:
+                spearman_loss = torch.tensor(0.0, device=device)
         else:
             spearman_loss = torch.tensor(0.0, device=device)
 
-        # Pull Loss
+        # Pull Loss: Eq. 5 in paper
+        # Lipull = |hsoft(riv) - 1| if matched, |hsoft(riv) - N| otherwise
+        # Final: (1/N) * Σ Lipull
         pull_loss = 0.0
+        total_keypoints = 0
         for b in range(B):
             all_indices = torch.arange(N, device=device)
             matched_mask = torch.zeros(N, dtype=torch.bool, device=device)
-            matched_mask[matches_a[b]] = True
+
+            # Filter out -1 padding
+            valid_matches = matches_a[b] >= 0
+            if valid_matches.sum() > 0:
+                matched_mask[matches_a[b][valid_matches]] = True
             unmatched_indices = all_indices[~matched_mask]
 
-            if num_matches > 0:
-                matched_soft_ranks_a = soft_ranks_a_norm[b, matches_a[b]]
-                matched_soft_ranks_b = soft_ranks_b_norm[b, matches_b[b]]
+            if valid_matches.sum() > 0:
+                matched_soft_ranks_a = soft_ranks_a_norm[b, matches_a[b][valid_matches]]
+                matched_soft_ranks_b = soft_ranks_b_norm[b, matches_b[b][valid_matches]]
                 pull_loss = pull_loss + (
                     F.l1_loss(matched_soft_ranks_a, torch.zeros_like(matched_soft_ranks_a)) +
                     F.l1_loss(matched_soft_ranks_b, torch.zeros_like(matched_soft_ranks_b))
                 )
+                total_keypoints += valid_matches.sum() * 2
 
             num_unmatched = len(unmatched_indices)
             if num_unmatched > 0:
@@ -256,9 +299,14 @@ class RankingLoss(nn.Module):
                     F.l1_loss(unmatched_soft_ranks_a, torch.ones_like(unmatched_soft_ranks_a)) +
                     F.l1_loss(unmatched_soft_ranks_b, torch.ones_like(unmatched_soft_ranks_b))
                 )
+                total_keypoints += num_unmatched * 2
 
-        pull_loss = pull_loss / (B * 2)
-        pull_loss_avg = pull_loss / N if N > 0 else pull_loss
+        # Normalize by N (total keypoints) as per paper
+        if total_keypoints > 0:
+            pull_loss_avg = pull_loss / total_keypoints
+        else:
+            pull_loss_avg = torch.tensor(0.0, device=device)
+
         total_loss = spearman_loss + self.lambda_ranker * pull_loss_avg
 
         return total_loss, {

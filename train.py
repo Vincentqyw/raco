@@ -18,9 +18,9 @@ from tqdm import tqdm
 
 from raco.datasets import get_dataset
 from raco.models import get_model
-from raco.models.utils.losses import DetectorLoss, RankingLoss, CovarianceLoss
+from raco.models.losses import DetectorLoss, RankingLoss, CovarianceLoss
 from raco.geometry.homography import transform_points_with_homography, compute_homography_jacobian
-from raco.utils.tensorboard_vis import create_scene_logger, EnhancedTensorBoardLogger
+from raco.utils.tensorboard_vis import create_scene_logger
 
 # Mixed precision training
 try:
@@ -68,7 +68,6 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5, scene_l
     model.eval()
     all_repeatability = []
     all_matching_scores = []
-    vis_count = 0
 
     logger.info("Running evaluation...")
 
@@ -143,20 +142,8 @@ def run_eval(model, eval_loader, device, writer, global_step, num_vis=5, scene_l
                     logger.warning(f"Failed to log scene {seq_name}: {e}")
 
             # Fallback: Log basic visualizations for non-tracked scenes
-            elif vis_count < num_vis and num_matches > 0:
-                try:
-                    from raco.utils.tensorboard_vis import denormalize_image
-                    img0 = data['image0']['image'][0]
-                    img0_vis = denormalize_image(img0)
-                    writer.add_image(f"eval/pair_{vis_count}/image", img0_vis, global_step)
-
-                    # Log heatmap of keypoint scores
-                    scores = pred['keypoint_scores_0'][0]
-                    writer.add_histogram(f"eval/pair_{vis_count}/scores", scores, global_step)
-
-                    vis_count += 1
-                except Exception:
-                    pass
+            else:
+                logger.warning(f"Skip logging to tensorboard")
 
     # Log metrics
     mean_rep = np.mean(all_repeatability) if all_repeatability else 0.0
@@ -288,12 +275,48 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                 kpts0_in_1 = transform_points_with_homography(kpts0, H_0to1)
                 kpts1_in_0 = transform_points_with_homography(kpts1, torch.inverse(H_0to1))
 
-                # Compute reprojection errors
-                errors_0_to_1 = (kpts0_in_1 - kpts1).unsqueeze(-1)  # (B, N, 2, 1)
-                errors_1_to_0 = (kpts1_in_0 - kpts0).unsqueeze(-1)
+                # Compute distance to nearest neighbor (matching the paper's definition)
+                # For each kpts0_in_1, find nearest neighbor in kpts1, then compute distance
+                # This is: d(xiA) = ||H_A→B(xiA) - NN(H_A→B(xiA))||
+
+                # Pairwise distances between kpts0_in_1 and kpts1 (B, N, N)
+                # Reused for detector, ranker, and covariance losses
+                dist_mat_0to1 = torch.cdist(kpts0_in_1, kpts1)
+                distances_0_to_1, nearest_idx_0_to_1 = dist_mat_0to1.min(dim=2)  # (B, N)
+
+                # Pairwise distances between kpts1_in_0 and kpts0 (B, N, N)
+                dist_mat_1to0 = torch.cdist(kpts1_in_0, kpts0)
+                distances_1_to_0, nearest_idx_1_to_0 = dist_mat_1to0.min(dim=2)  # (B, N)
+
+                # For covariance loss, compute mutual nearest neighbor matches
+                # This gives us M - the set of ground truth matches (Eq. 7)
+                min_dist_0to1, matches_0to1 = dist_mat_0to1.min(dim=2)
+                _, matches_1to0 = dist_mat_1to0.min(dim=1)
+
+                # Create valid match mask: mutual nearest neighbors within threshold
+                match_threshold = 3.0
+                mutual_match_mask = (matches_1to0.gather(1, matches_0to1) ==
+                                   torch.arange(kpts0.shape[1], device=kpts0.device).unsqueeze(0)) & \
+                                   (min_dist_0to1 < match_threshold)
+
+                # Compute reprojection error vectors for covariance loss (not for detector loss)
+                # Gather the nearest neighbor keypoints
+                batch_idx = torch.arange(B, device=kpts0.device).unsqueeze(1).expand(-1, kpts0.shape[1])
+                nearest_kpts1 = kpts1[batch_idx, nearest_idx_0_to_1]  # (B, N, 2)
+                nearest_kpts0 = kpts0[batch_idx, nearest_idx_1_to_0]  # (B, N, 2)
+
+                # Error vectors (for covariance loss) - (B, N, 2) for einsum
+                errors_0_to_1 = (kpts0_in_1 - nearest_kpts1)  # (B, N, 2)
+                errors_1_to_0 = (kpts1_in_0 - nearest_kpts0)  # (B, N, 2)
 
                 valid_0_to_1 = get_valid_mask(kpts0_in_1, H, W)
                 valid_1_to_0 = get_valid_mask(kpts1_in_0, H, W)
+
+                # Check for NaN/Inf in reprojection errors before loss computation
+                if not torch.isfinite(errors_0_to_1).all() or not torch.isfinite(errors_1_to_0).all():
+                    logger.warning(f"Skipping batch {iteration}: NaN/Inf in reprojection errors")
+                    breakpoint()
+                    continue
 
                 # Compute loss based on stage
                 if stage == "detector":
@@ -301,35 +324,38 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                     prob_0_sparse = pred["image0"]["keypoint_scores"]
                     prob_1_sparse = pred["image1"]["keypoint_scores"]
 
-                    # Compute loss on sparse samples
-                    loss_0, loss_0_details = det_loss_fn.forward_sparse(prob_0_sparse, errors_0_to_1, valid_0_to_1)
-                    loss_1, loss_1_details = det_loss_fn.forward_sparse(prob_1_sparse, errors_1_to_0, valid_1_to_0)
+                    # Compute loss on sparse samples (pass distances, not error vectors)
+                    # detector loss expects (B, N) or (B, N, 2)
+                    loss_0, loss_0_details = det_loss_fn.forward_sparse(prob_0_sparse, distances_0_to_1, valid_0_to_1)
+                    loss_1, loss_1_details = det_loss_fn.forward_sparse(prob_1_sparse, distances_1_to_0, valid_1_to_0)
                     loss = (loss_0 + loss_1) / 2.0
                     
                     detector_loss_0_rewards = loss_0_details['rewards']
                     detector_loss_1_rewards = loss_1_details['rewards']
 
-                    # Debug: check if loss is 0 and why
+                    # Debug: check if loss is 0 and why (now handled by early exit)
                     if loss.item() == 0 and iteration % 10 == 0:
-                        logger.warning(
-                            f"Loss is 0! valid_ratio={valid_0_to_1.float().mean():.3f}, "
-                            f"prob_mean={prob_0_sparse.mean():.6f}, "
-                            f"errors_mean={errors_0_to_1.mean():.3f}"
+                        distances0 = detector_loss_0_rewards['distances']
+                        distances1 = detector_loss_1_rewards['distances']
+                        logger.info(
+                            f"Zero loss at iter {iteration}: valid_ratio={valid_0_to_1.float().mean():.3f}, "
+                            f"prob_mean={prob_0_sparse.mean():.6f}, ",
+                            f"distances0={distances0.mean():.6f}, ",
+                            f"distances1={distances1.mean():.6f}",
                         )
+                        breakpoint()
 
                     det_loss_fn.set_step(iteration)
 
                 elif stage == "ranker":
-                    # Ranking loss using soft ranking
+                    # Ranking loss using soft ranking (reuses dist_mat computed earlier)
 
                     ranker_scores_0 = pred["ranker_scores_0"]  # (B, N)
                     ranker_scores_1 = pred["ranker_scores_1"]
-                    # Find matches for ranking
-                    distances = torch.cdist(kpts0_in_1, kpts1)
 
-                    # Mutual nearest neighbors
-                    min_dist_0to1, matches_0to1 = distances.min(dim=2)
-                    _, matches_1to0 = distances.min(dim=1)
+                    # Mutual nearest neighbors from precomputed pairwise distances
+                    min_dist_0to1, matches_0to1 = dist_mat_0to1.min(dim=2)
+                    _, matches_1to0 = dist_mat_1to0.min(dim=1)
 
                     matches_a = []
                     matches_b = []
@@ -367,7 +393,8 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                     )
 
                 elif stage == "covariance":
-                    # Covariance loss using reprojection error
+                    # Covariance loss using reprojection error (Eq. 6-7 in paper)
+                    # Only compute loss on matched keypoints (M)
                     covariances_0 = pred["covariances_0"]  # (B, N, 2, 2)
                     covariances_1 = pred["covariances_1"]
 
@@ -375,11 +402,12 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                     jacobian_0_to_1 = compute_homography_jacobian(H_0to1, kpts0)
                     jacobian_1_to_0 = compute_homography_jacobian(torch.inverse(H_0to1), kpts1)
 
-                    # Compute bidirectional loss
+                    # Compute bidirectional loss only on matched keypoints
                     loss, _ = cov_loss_fn.forward_bidirectional(
                         covariances_0, covariances_1,
                         errors_0_to_1, errors_1_to_0,
                         jacobian_0_to_1, jacobian_1_to_0,
+                        valid_mask=mutual_match_mask,
                     )
 
                 else:
@@ -489,7 +517,7 @@ def main():
     writer = SummaryWriter(output_dir / "tb_logs")
 
     # Create scene logger for tracking specific HPatches scenes
-    scene_logger = create_scene_logger(writer, tracked_scenes=["i_ajuntament", "v_adam"])
+    scene_logger = create_scene_logger(writer)
 
     # Load model
     model = get_model(conf.model.name)(conf.model).to(device)
@@ -513,7 +541,7 @@ def main():
         try:
             # HPatches uses data_dir, separate from oxford_paris data_root
             eval_conf = OmegaConf.create({
-                "data_dir": "/mnt/e/datasets/hpatches-sequences-release",
+                "data_dir": conf.eval.get("data_root", "/mnt/e/datasets/hpatches-sequences-release"),
                 "scene_type": "all",
                 "batch_size": conf.eval.get("batch_size", 1),
                 "num_workers": conf.eval.get("num_workers", 2),

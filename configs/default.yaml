@@ -26,14 +26,13 @@ dataset:
 # Model configuration
 model:
   name: raco
-  max_num_keypoints: 256
+  max_num_keypoints: 480
   nms_radius: 3
   subpixel_sampling: true
   subpixel_temp: 0.5
-  # ranker: true
   covariance_estimator: true
   sort_by_ranker: false
-  weights: /root/.cache/torch/hub/checkpoints/raco.pth  # pretrained weights, /root/.cache/torch/hub/checkpoints/raco.pth
+  weights: null #/root/.cache/torch/hub/checkpoints/raco.pth  # pretrained weights, /root/.cache/torch/hub/checkpoints/raco.pth
   detector:
     d_max: 1.2
     rho_pos: 1.0
@@ -44,14 +43,14 @@ model:
 # Training configuration
 train:
   stage: all
-  lr: 1.0e-4                # Reduced from 2e-4 for stability
-  weight_decay: 1.0e-4
+  lr: 2.0e-4                # Reduced from 2e-4 for stability
+  weight_decay: 1.0e-6
   detector_steps: 20000
   ranker_epochs: 1
   covariance_steps: 20000
   log_interval: 10          # More frequent logging for debugging
-  save_interval: 2000
-  eval_interval: 2000      # Less frequent eval for speed
+  save_interval: 1000
+  eval_interval: 1000      # Less frequent eval for speed
   eval_during_training: true  # Disable during initial debugging
   use_amp: false             # Mixed precision training
   compile: false            # torch.compile() (PyTorch 2.0+)
@@ -62,8 +61,9 @@ output:
 
 # Evaluation configuration
 eval:
+  data_root: /mnt/e/datasets/hpatches-sequences-release
   batch_size: 1
   num_workers: 8
   # Fast eval options (set to null for full evaluation)
-  max_scenes: 5        # Limit number of scenes (e.g., 10 for quick eval)
+  max_scenes: 4        # Limit number of scenes (e.g., 10 for quick eval)
   max_pairs_per_scene: 1  # Limit pairs per scene (e.g., 2 for quick eval)
