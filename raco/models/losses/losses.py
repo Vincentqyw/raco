@@ -192,13 +192,10 @@ class RankingLoss(nn.Module):
         self.lambda_ranker = lambda_ranker
         self.regularization_strength = regularization_strength
 
-        try:
-            from fast_soft_sort.pytorch_ops import soft_rank
-            self.soft_rank = soft_rank
-            self.has_soft_sort = True
-        except ImportError:
-            self.soft_rank = None
-            self.has_soft_sort = False
+        # Use internal soft_rank implementation (no external dependencies)
+        from .soft_rank import soft_rank
+        self.soft_rank = soft_rank
+        self.has_soft_sort = True
 
     def _soft_rank_approximation(self, scores: torch.Tensor, tau: float = 0.1) -> torch.Tensor:
         """Differentiable soft rank approximation using softmax."""
@@ -238,18 +235,16 @@ class RankingLoss(nn.Module):
         device = ranker_scores_a.device
 
         # Compute soft ranks
-        if self.has_soft_sort and ranker_scores_a.is_cpu:
-            soft_ranks_a = self.soft_rank(
-                ranker_scores_a, direction="ASCENDING",
-                regularization_strength=self.regularization_strength,
-            ).to(device)
-            soft_ranks_b = self.soft_rank(
-                ranker_scores_b, direction="ASCENDING",
-                regularization_strength=self.regularization_strength,
-            ).to(device)
-        else:
-            soft_ranks_a = self._soft_rank_approximation(ranker_scores_a)
-            soft_ranks_b = self._soft_rank_approximation(ranker_scores_b)
+        soft_ranks_a = self.soft_rank(
+            ranker_scores_a,
+            direction="ASCENDING",
+            regularization_strength=self.regularization_strength
+        )
+        soft_ranks_b = self.soft_rank(
+            ranker_scores_b,
+            direction="ASCENDING",
+            regularization_strength=self.regularization_strength
+        )
 
         # Normalize ranks to [0, 1] for numerical stability
         soft_ranks_a_norm = (soft_ranks_a - 1) / (N - 1 + 1e-8)  # (B, N)
