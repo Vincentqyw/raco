@@ -19,6 +19,7 @@ from raco.datasets import get_dataset
 from raco.models import get_model
 from raco.models.losses import DetectorLoss, RankingLoss, CovarianceLoss
 from raco.geometry.homography import transform_points_with_homography, compute_homography_jacobian
+from raco.geometry.matching import get_valid_mask, find_matches, compute_mutual_dist
 from raco.utils.tensorboard_vis import create_scene_logger
 
 # Mixed precision training
@@ -31,72 +32,6 @@ except ImportError:
         AMP_AVAILABLE = True
     except ImportError:
         AMP_AVAILABLE = False
-
-def get_valid_mask(points, H_val, W_val):
-    return ((points[..., 0] >= 0) & (points[..., 0] < W_val) &
-            (points[..., 1] >= 0) & (points[..., 1] < H_val))
-
-def find_matches(kpts_a, kpts_b, H, threshold=3.0):
-    """Find matches between keypoints using homography."""
-
-    kpts_a_in_b = transform_points_with_homography(
-        kpts_a.unsqueeze(0), H.unsqueeze(0)
-    ).squeeze(0)
-
-    distances = torch.cdist(kpts_a_in_b, kpts_b)
-    min_dist_a_to_b, closest_b_to_a = distances.min(dim=1)
-    _, closest_a_to_b = distances.min(dim=0)
-
-    matches_a, matches_b = [], []
-    for i in range(len(kpts_a)):
-        j = closest_b_to_a[i]
-        if closest_a_to_b[j] == i and min_dist_a_to_b[i] < threshold:
-            matches_a.append(i)
-            matches_b.append(j)
-
-    if len(matches_a) == 0:
-        return torch.tensor([], dtype=torch.long, device=kpts_a.device), \
-               torch.tensor([], dtype=torch.long, device=kpts_b.device)
-
-    return torch.tensor(matches_a, device=kpts_a.device), \
-           torch.tensor(matches_b, device=kpts_b.device)
-
-
-def compute_mutual_dist(kpts0_trans, kpts1, threshold=3.0):
-    """
-    Compute Mutual Nearest Neighbors (MNN) between two point sets.
-
-    Args:
-        kpts0_trans: Keypoints from view 0 projected to view 1 coordinates (B, N0, 2)
-        kpts1: Keypoints from view 1 (B, N1, 2)
-        threshold: Maximum Euclidean distance to be considered a valid match
-
-    Returns:
-        mutual_mask: Boolean mask (B, N0), indicating which kpts0 have valid MNN
-        nearest_idx: Corresponding kpts1 indices (B, N0)
-        dist01: Nearest neighbor distances (B, N0)
-    """
-    B, N0, _ = kpts0_trans.shape
-    device = kpts0_trans.device
-
-    # 1. Compute pairwise distance matrix (B, N0, N1)
-    dist_mat = torch.cdist(kpts0_trans, kpts1)
-
-    # 2. Compute bidirectional nearest neighbors
-    # kpts0's nearest neighbor in kpts1
-    dist01, idx01 = dist_mat.min(dim=2)  # (B, N0)
-    # kpts1's nearest neighbor in kpts0
-    dist10, idx10 = dist_mat.min(dim=1)  # (B, N1) - unused
-
-    # 3. Mutual nearest neighbor check
-    # For each kpts0[i], check if kpts1[nn(i)]'s nearest neighbor is i
-    target = torch.arange(N0, device=device).unsqueeze(0).expand(B, -1)
-    rev_idx = idx10.gather(1, idx01)  # (B, N0)
-
-    # 4. Generate mask: (index match) AND (distance < threshold)
-    mutual_mask = (rev_idx == target) & (dist01 < threshold)
-
-    return mutual_mask, idx01, dist01
 
 def run_eval(model, eval_loader, device, writer, global_step, num_vis=5, scene_logger=None):
     """Run evaluation and log to tensorboard."""
@@ -342,7 +277,7 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, stage = 
 
 
                 # Debug: visualize training matches
-                if iteration % 100 == 0:
+                if 0 and iteration % 100 == 0:
                     from visualize_training_matches import visualize_training_batch, visualize_homography_effect
                     visualize_training_batch(
                         batch, pred,

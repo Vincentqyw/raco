@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
 from typing import Tuple, Dict, Optional
+from .soft_rank import soft_rank
 
 
 class DetectorLoss(nn.Module):
@@ -193,7 +194,6 @@ class RankingLoss(nn.Module):
         self.regularization_strength = regularization_strength
 
         # Use internal soft_rank implementation (no external dependencies)
-        from .soft_rank import soft_rank
         self.soft_rank = soft_rank
         self.has_soft_sort = True
 
