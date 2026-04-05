@@ -65,6 +65,33 @@ def log_covariance_metrics(
     writer.add_scalar("covariance/nll_1_to_0", loss_metrics['cov_nll_1_to_0'], iteration)
 
 
+def log_ranker_covariance_metrics(
+    writer: SummaryWriter,
+    iteration: int,
+    loss_metrics: Dict[str, float]
+) -> None:
+    """
+    Log ranker_covariance joint training metrics to TensorBoard.
+
+    Args:
+        writer: TensorBoard writer
+        iteration: Current training step
+        loss_metrics: Dict with combined loss metrics from ranker and covariance
+    """
+    # Log ranker metrics
+    writer.add_scalar("ranker_covariance/spearman_loss", loss_metrics['spearman_loss'], iteration)
+    writer.add_scalar("ranker_covariance/pull_loss", loss_metrics['pull_loss'], iteration)
+    # Log covariance metrics
+    writer.add_scalar("ranker_covariance/nll_0_to_1", loss_metrics['cov_nll_0_to_1'], iteration)
+    writer.add_scalar("ranker_covariance/nll_1_to_0", loss_metrics['cov_nll_1_to_0'], iteration)
+
+    # Log weighted losses (if present)
+    if 'weighted_ranker' in loss_metrics:
+        writer.add_scalar("ranker_covariance/weighted_ranker", loss_metrics['weighted_ranker'], iteration)
+    if 'weighted_cov' in loss_metrics:
+        writer.add_scalar("ranker_covariance/weighted_cov", loss_metrics['weighted_cov'], iteration)
+
+
 def log_gradients(
     writer: SummaryWriter,
     model: torch.nn.Module,
@@ -130,6 +157,13 @@ def build_postfix(
         postfix["nll_0"] = f"{loss_metrics.get('cov_nll_0_to_1', 0):.4f}"
         postfix["nll_1"] = f"{loss_metrics.get('cov_nll_1_to_0', 0):.4f}"
 
+    elif stage == "ranker_covariance":
+        # Show both ranker and covariance metrics
+        postfix["spearman"] = f"{loss_metrics.get('spearman_loss', 0):.4f}"
+        postfix["pull"] = f"{loss_metrics.get('pull_loss', 0):.4f}"
+        postfix["nll_0"] = f"{loss_metrics.get('cov_nll_0_to_1', 0):.4f}"
+        postfix["nll_1"] = f"{loss_metrics.get('cov_nll_1_to_0', 0):.4f}"
+
     return postfix
 
 
@@ -137,6 +171,7 @@ __all__ = [
     'log_detector_metrics',
     'log_ranker_metrics',
     'log_covariance_metrics',
+    'log_ranker_covariance_metrics',
     'log_gradients',
     'build_postfix',
 ]

@@ -13,12 +13,13 @@ def set_stage_require_grad(model: torch.nn.Module, stage: str) -> None:
 
     Args:
         model: RaCo model
-        stage: Training stage (detector/ranker/covariance)
+        stage: Training stage (detector/ranker/covariance/ranker_covariance)
 
     Note:
         Detector params: encoder (block1-4, conv1-4, pool2, pool4, gate) + score_head
         Ranker params: ranker_head
         Covariance params: covariance_estimator_head
+        Ranker+Covariance params: ranker_head + covariance_estimator_head
     """
     detector_names = [
         "block1", "block2", "block3", "block4",
@@ -37,6 +38,9 @@ def set_stage_require_grad(model: torch.nn.Module, stage: str) -> None:
         elif stage == "covariance":
             # Only covariance_estimator_head
             param.requires_grad = ("covariance_estimator_head" in name) or ("var_activation" in name)
+        elif stage == "ranker_covariance":
+            # Both ranker_head and covariance_estimator_head
+            param.requires_grad = ("ranker_head" in name) or ("covariance_estimator_head" in name) or ("var_activation" in name)
         else:
             param.requires_grad = False
 

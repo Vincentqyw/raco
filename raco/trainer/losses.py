@@ -126,7 +126,6 @@ def compute_covariance_loss(
     mutual_mask_1_to_0: torch.Tensor,
     nearest_idx_0_to_1: torch.Tensor,
     nearest_idx_1_to_0: torch.Tensor,
-    B: int
 ) -> Tuple[torch.Tensor, Dict]:
     """
     Compute covariance loss using reprojection error.
@@ -143,13 +142,14 @@ def compute_covariance_loss(
         mutual_mask_1_to_0: Mutual match mask (B, N)
         nearest_idx_0_to_1: Nearest neighbor indices (B, N)
         nearest_idx_1_to_0: Nearest neighbor indices (B, N)
-        B: Batch size
 
     Returns:
         Tuple of (loss, metrics_dict)
     """
     covariances_0 = pred["covariances_0"]  # (B, N, 2, 2)
     covariances_1 = pred["covariances_1"]
+
+    B = covariances_0.shape[0]
 
     # Compute Jacobians
     jacobian_0_to_1 = compute_homography_jacobian(H_0to1, kpts0)

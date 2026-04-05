@@ -428,6 +428,7 @@ def main():
                         pred=pred_formatted,
                         global_step=0,  # Single eval, use step 0
                         img_idx=img_idx,
+                        seed=conf.dataset.seed,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to log scene {seq_name}: {e}")

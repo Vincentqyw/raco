@@ -286,6 +286,86 @@ def create_keypoints_overlay_figure(
     return figure_to_tensor(fig)
 
 
+def create_keypoints_with_covariance_ellipses_overlay_figure(
+    image: torch.Tensor,
+    keypoints: torch.Tensor,
+    covariances: torch.Tensor,
+    subsample: int = 10,
+    sigma: int = 20,
+    title: str = "RaCo Keypoint Detection with Uncertainties",
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    Create visualization of keypoints with covariance ellipses overlay on image.
+
+    Uses viz2d utilities for consistent visualization with training examples.
+
+    Args:
+        image: Image tensor [3, H, W] (normalized)
+        keypoints: Keypoints tensor [N, 2]
+        covariances: Covariance matrices tensor [N, 2, 2]
+        subsample: Subsample factor for cleaner visualization (default: 10)
+        sigma: Number of standard deviations for ellipse size (default: 20)
+        title: Plot title
+        seed: Random seed for reproducible subsampling
+
+    Returns:
+        Figure as torch tensor [3, H, W] for TensorBoard
+    """
+    from raco.utils import viz2d
+
+    # Denormalize image
+    if isinstance(image, torch.Tensor):
+        img_np = denormalize_image(image).permute(1, 2, 0).cpu().numpy()
+    else:
+        img_np = image
+
+    # Convert to numpy if needed
+    if isinstance(keypoints, torch.Tensor):
+        keypoints_np = keypoints.cpu().detach().numpy()
+    else:
+        keypoints_np = keypoints
+
+    if isinstance(covariances, torch.Tensor):
+        covariances_np = covariances.cpu().detach().numpy()
+    else:
+        covariances_np = covariances
+
+    # Subsample keypoints for cleaner visualization
+    n_keypoints = len(keypoints_np)
+    if n_keypoints > subsample:
+        idxs = np.random.RandomState(seed).permutation(n_keypoints)[::subsample]
+        subsampled_keypoints = keypoints_np[idxs]
+        subsampled_covariances = covariances_np[idxs]
+    else:
+        subsampled_keypoints = keypoints_np
+        subsampled_covariances = covariances_np
+
+    # Create figure using viz2d
+    ax = viz2d.plot_images([img_np])
+
+    # Plot covariance ellipses on subsampled keypoints
+    viz2d.plot_covariance_ellipses(
+        [subsampled_keypoints],
+        [subsampled_covariances],
+        axes=ax,
+        sigma=sigma,
+    )
+
+    # Plot all keypoints
+    viz2d.plot_keypoints(
+        [keypoints_np],
+        axes=ax,
+    )
+
+    # Add title
+    plt.suptitle(title, fontsize=9, y=0.95)
+    plt.tight_layout()
+
+    # Convert to tensor
+    return figure_to_tensor(plt.gcf())
+
+
 class EnhancedTensorBoardLogger:
     """
     Enhanced TensorBoard logger for RaCo training visualization.
@@ -331,6 +411,7 @@ class EnhancedTensorBoardLogger:
         pred: Dict,
         global_step: int,
         img_idx: int = 0,
+        seed: int = 42,
     ):
         """
         Log all visualizations for a single scene prediction.
@@ -350,6 +431,7 @@ class EnhancedTensorBoardLogger:
         # Get reference image for overlays
         img0 = data["image0"]["image"][0]  # [3, H, W]
         img_denorm = denormalize_image(img0)
+
 
         # 1. Log prob_map heatmap (detection probability)
         if "prob_map" in pred.get("image0", {}):
@@ -374,54 +456,25 @@ class EnhancedTensorBoardLogger:
             self.writer.add_image(f"{tag_prefix}/prob_overlay", overlay_fig, global_step)
 
         # 2. Log ranker score map if available
-        if "ranker_scores" in pred.get("image0", {}):
+        if "ranker_map" in pred.get("image0", {}):
             # Ranker scores are per-keypoint, need to scatter to image
-            ranker_scores = pred["image0"]["ranker_scores"][0].cpu().numpy()  # [N]
-            keypoints = pred["image0"]["keypoints"][0].cpu().numpy()  # [N, 2]
-
-            if len(keypoints) > 0:
-                # Create dense ranker map
-                H, W = img0.shape[-2:]
-                ranker_map = create_dense_map_from_points(
-                    keypoints, ranker_scores, (H, W), sigma=3.0
-                )
-
-                ranker_fig = create_heatmap_figname(
-                    ranker_map,
-                    title=f"Ranker Scores - {seq_name}",
-                    cmap="plasma",
-                    colorbar_label="Rank",
-                )
-                self.writer.add_image(f"{tag_prefix}/ranker_map", ranker_fig, global_step)
+            ranker_map = pred["image0"]["ranker_map"][0].cpu().numpy().squeeze()
+            ranker_fig = create_heatmap_figname(
+                ranker_map,
+                title=f"Ranker Scores - {seq_name}",
+                cmap="plasma",
+                colorbar_label="Rank",
+            )
+            self.writer.add_image(f"{tag_prefix}/ranker_map", ranker_fig, global_step)
 
         # 3. Log covariance maps if available
-        if "covariances" in pred.get("image0", {}):
-            covariances = pred["image0"]["covariances"][0].cpu().numpy()  # [N, 2, 2]
-            keypoints = pred["image0"]["keypoints"][0].cpu().numpy()  # [N, 2]
-
-            if len(keypoints) > 0:
-                H, W = img0.shape[-2:]
-
-                # Extract Cholesky factors from covariances and create maps
-                # cov = L @ L.T where L = [[L11, 0], [L21, L22]]
-                L11_vals = np.sqrt(covariances[:, 0, 0])  # sqrt of variance
-                L22_vals = np.sqrt(covariances[:, 1, 1])
-                L21_vals = covariances[:, 1, 0] / (L11_vals + 1e-8)  # covariance / sqrt(var_x)
-
-                # Create dense maps
-                L11_map = create_dense_map_from_points(keypoints, L11_vals, (H, W), sigma=3.0)
-                L21_map = create_dense_map_from_points(keypoints, L21_vals, (H, W), sigma=3.0)
-                L22_map = create_dense_map_from_points(keypoints, L22_vals, (H, W), sigma=3.0)
-
-                cov_maps = np.stack([L11_map, L21_map, L22_map], axis=-1)
-                cov_figs = create_covariance_figures(
-                    cov_maps,
-                    title_prefix=f"{seq_name}",
-                )
-
-                self.writer.add_image(
-                    f"{tag_prefix}/covariance_maps", cov_figs["combined"], global_step
-                )
+        if "covariances_map" in pred.get("image0", {}):
+            covariances_map = pred["image0"]["covariances_map"][0].cpu().numpy()  # [3, H, W]
+            covariances_map = covariances_map.transpose(1, 2, 0)  # [H, W, 3]
+            cov_figs = create_covariance_figures(covariances_map,title_prefix=f"{seq_name}")
+            self.writer.add_image(
+                f"{tag_prefix}/covariance_maps", cov_figs["combined"], global_step
+            )
 
         # 4. Log keypoints overlay
         keypoints = pred["keypoints_0"][0]  # [N, 2]
@@ -439,6 +492,16 @@ class EnhancedTensorBoardLogger:
             title=f"Keypoints - {seq_name}",
         )
         self.writer.add_image(f"{tag_prefix}/keypoints", kpts_fig, global_step)
+
+        kpts_cov = create_keypoints_with_covariance_ellipses_overlay_figure(
+            img0,         # [3, H, W]
+            keypoints,    # [N, 2]
+            pred["image0"]["covariances"][0].cpu().numpy(), # [N, 2, 2]
+            subsample=10,
+            sigma=20,
+            seed=seed,
+        )
+        self.writer.add_image(f"{tag_prefix}/keypoints_with_cov", kpts_cov, global_step)
 
         # Store in history for potential later comparison
         self.scene_history[f"{seq_name}_{img_idx}_{global_step}"] = {

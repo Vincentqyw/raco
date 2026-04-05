@@ -12,16 +12,17 @@ from typing import Dict, Any, Optional
 
 from raco.geometry.homography import transform_points_with_homography
 from raco.geometry.matching import find_matches
-
+from raco.models.extractors.raco import RaCo
 
 def run_eval(
-    model,
+    model: RaCo,
     eval_loader,
     device: str,
     writer: SummaryWriter,
     global_step: int,
     num_vis: int = 5,
-    scene_logger=None
+    scene_logger=None,
+    seed: int = 42,
 ) -> Dict[str, float]:
     """
     Run evaluation and log metrics to TensorBoard.
@@ -46,7 +47,7 @@ def run_eval(
 
     # Initialize scene logger if not provided
     if scene_logger is None:
-        from raco.utils.visualization import create_scene_logger
+        from raco.utils.tensorboard_vis import create_scene_logger
         scene_logger = create_scene_logger(writer)
 
     with torch.no_grad():
@@ -100,6 +101,8 @@ def run_eval(
                         "ranker_scores": pred.get("ranker_scores_0", None),
                         "covariances": pred.get("covariances_0", None),
                         "keypoints": pred.get("keypoints_0", None),
+                        "ranker_map": pred.get("ranker_map_0", None),
+                        "covariances_map": pred.get("covariances_map_0", None),
                     },
                     "keypoints_0": pred.get("keypoints_0"),
                     "keypoint_scores_0": pred.get("keypoint_scores_0"),
@@ -111,6 +114,7 @@ def run_eval(
                         pred=pred_formatted,
                         global_step=global_step,
                         img_idx=img_idx,
+                        seed=seed,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to log scene {seq_name}: {e}")

@@ -9,46 +9,66 @@ from typing import Tuple
 
 
 def compute_homography_jacobian(
-    homography: torch.Tensor,
-    points: torch.Tensor,
-    epsilon: float = 1e-8,
+    homography: torch.Tensor, 
+    points: torch.Tensor, 
+    eps: float = 1e-7
 ) -> torch.Tensor:
     """
-    Compute Jacobian of homography transformation at given points.
-
+    Computes the 2x2 Jacobian of a homography transformation w.r.t. input points.
+    
     Args:
-        homography: (B, 3, 3) homography matrix
-        points: (B, N, 2) points in pixel coordinates (x, y)
-
+        homography: (B, 3, 3) Homography matrices.
+        points: (B, N, 2) Keypoint coordinates (x, y).
+        eps: Small constant to prevent division by zero and extreme values.
+        
     Returns:
-        Jacobian matrices (B, N, 2, 2)
+        J: (B, N, 2, 2) Jacobian matrices.
     """
     B, N, _ = points.shape
     device = points.device
 
-    # Convert to homogeneous coordinates
-    ones = torch.ones(B, N, 1, device=device)
-    points_h = torch.cat([points, ones], dim=-1)  # (B, N, 3)
+    # Extract H components for readability
+    # H = [[h11, h12, h13], [h21, h22, h23], [h31, h32, h33]]
+    h = homography.view(B, 1, 3, 3)
+    h11, h12 = h[..., 0, 0], h[..., 0, 1]
+    h21, h22 = h[..., 1, 0], h[..., 1, 1]
+    h31, h32, h33 = h[..., 2, 0], h[..., 2, 1], h[..., 2, 2]
 
-    # Apply homography
-    transformed_h = torch.einsum('bij,bnj->bni', homography, points_h)  # (B, N, 3)
-    u, v, w = transformed_h[..., 0], transformed_h[..., 1], transformed_h[..., 2]
+    x, y = points[..., 0], points[..., 1]
 
-    # Avoid division by zero
-    w_safe = w.clamp(min=epsilon)
+    # 1. Compute the denominator (w) and projected coordinates (x', y')
+    w = h31 * x + h32 * y + h33
+    
+    # Numerical Stability: Ensure w is not too close to zero to avoid J -> inf
+    # We use a signed clamp to preserve the projection direction
+    w_safe = torch.where(w.abs() < eps, eps * w.sign().clamp(min=1.0), w)
+    
+    # Compute projected points
+    u = h[..., 0, 0] * x + h[..., 0, 1] * y + h[..., 0, 2]
+    v = h[..., 1, 0] * x + h[..., 1, 1] * y + h[..., 1, 2]
+    x_prime = u / w_safe
+    y_prime = v / w_safe
 
-    # Derivatives of normalized coordinates [u/w, v/w]
-    J_norm = torch.zeros(B, N, 2, 3, device=device)
-    J_norm[..., 0, 0] = 1.0 / w_safe      # d(u/w)/du
-    J_norm[..., 0, 2] = -u / (w_safe ** 2)  # d(u/w)/dw
-    J_norm[..., 1, 1] = 1.0 / w_safe      # d(v/w)/dv
-    J_norm[..., 1, 2] = -v / (w_safe ** 2)  # d(v/w)/dw
+    # 2. Construct the Jacobian entries using the quotient rule
+    # J = [ [dx'/dx, dx'/dy], [dy'/dx, dy'/dy] ]
+    inv_w = 1.0 / w_safe
+    
+    j11 = inv_w * (h11 - x_prime * h31)
+    j12 = inv_w * (h12 - x_prime * h32)
+    j21 = inv_w * (h21 - y_prime * h31)
+    j22 = inv_w * (h22 - y_prime * h32)
 
-    # Full Jacobian: J = J_norm @ H[:, :, :2]
-    H_first_two = homography[:, :, :2]  # (B, 3, 2)
-    H_expanded = H_first_two[:, None, :, :].expand(B, N, 3, 2)
-    J = torch.einsum('bnij,bnjk->bnik', J_norm, H_expanded)
+    # 3. Stack into (B, N, 2, 2)
+    J = torch.stack([
+        torch.stack([j11, j12], dim=-1),
+        torch.stack([j21, j22], dim=-1)
+    ], dim=-2)
 
+    # 4. Final Safety Clamp
+    # Even with w_safe, if x_prime is massive, J can explode.
+    # A Jacobian > 1e6 is usually physically meaningless for pixel coordinates.
+    J = torch.clamp(J, min=-1e5, max=1e5)
+    
     return J
 
 

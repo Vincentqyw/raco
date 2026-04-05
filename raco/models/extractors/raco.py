@@ -254,6 +254,14 @@ class RaCo(BaseModel):
                 pred[f"ranker_scores_{i}"] = features["ranker_scores"]
             if "covariances" in features:
                 pred[f"covariances_{i}"] = features["covariances"]
+            if "raw_scores" in features:
+                pred[f"raw_scores_{i}"] = features["raw_scores"]
+            if "prob_map" in features:
+                pred[f"prob_map_{i}"] = features["prob_map"]
+            if "ranker_map" in features:
+                pred[f"ranker_map_{i}"] = features["ranker_map"]
+            if "covariances_map" in features:
+                pred[f"covariances_map_{i}"] = features["covariances_map"]
 
         return pred
 
@@ -334,6 +342,8 @@ class RaCo(BaseModel):
                 ranker_feat, kpts, H, W, self.conf.subpixel_sampling
             )
             result["ranker_scores"] = ranker_scores
+            if not self.training:
+                result["ranker_map"] = ranker_feat  # B x 1 x H x W
 
         # Covariance
         if self.conf.covariance_estimator:
@@ -348,6 +358,8 @@ class RaCo(BaseModel):
                 cov_feat, kpts, H, W, self.conf.subpixel_sampling
             )
             result["covariances"] = _covariance_matrix_from_cholesky(cov_values)
+            if not self.training:
+                result["covariances_map"] = cov_feat  # B x 3 x H x W
 
         # Sort by ranker if requested
         if self.conf.sort_by_ranker and "ranker_scores" in result:

@@ -19,11 +19,32 @@ from raco.evaluation import run_eval
 from raco.trainer import StageTrainer, save_checkpoint
 
 
+def load_weights(model, args, conf, device):
+    """
+    Load weights from resume argument or config.
+
+    Args:
+        model: Model to load weights into
+        args: CLI arguments
+        conf: OmegaConf configuration
+        device: Device to load weights to
+
+    Returns:
+        bool: True if weights were loaded, False otherwise
+    """
+    weight_path = args.resume if args.resume else conf.model.get("weights", None)
+    if weight_path:
+        logger.info(f"Loading weights from {weight_path}")
+        model.load_state_dict(torch.load(weight_path, map_location=device))
+        return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--conf", type=str, default="configs/default.yaml")
     parser.add_argument("-s", "--stage", type=str, default="detector",
-                        choices=["detector", "ranker", "covariance", "all"])
+                        choices=["detector", "ranker", "covariance", "ranker_covariance", "all"])
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--eval_only", action="store_true", help="Run eval only")
     args = parser.parse_args()
@@ -60,9 +81,8 @@ def main():
         logger.info("Compiling model with torch.compile()")
         model = torch.compile(model)
 
-    if args.resume:
-        logger.info(f"Loading checkpoint from {args.resume}")
-        model.load_state_dict(torch.load(args.resume, map_location=device))
+    # Load weights if provided
+    weights_loaded = load_weights(model, args, conf, device)
 
     # Load datasets
     train_dataset = get_dataset(conf.dataset.name)(conf.dataset)
@@ -74,14 +94,15 @@ def main():
         try:
             # HPatches uses data_dir, separate from oxford_paris data_root
             eval_conf = OmegaConf.create({
-                "data_dir": conf.eval.get("data_root", "/mnt/e/datasets/hpatches-sequences-release"),
+                "name": conf.eval.get("name", "hpatches"),
+                "data_dir": conf.eval.get("data_root"),
                 "scene_type": "all",
                 "batch_size": conf.eval.get("batch_size", 1),
                 "num_workers": conf.eval.get("num_workers", 2),
                 "max_scenes": conf.eval.get("max_scenes", None),
                 "max_pairs_per_scene": conf.eval.get("max_pairs_per_scene", None),
             })
-            eval_dataset = get_dataset("hpatches")(eval_conf)
+            eval_dataset = get_dataset(eval_conf.name)(eval_conf)
             eval_loader = eval_dataset.get_data_loader("test", shuffle=False)
             logger.info(f"Eval dataset: {len(eval_loader.dataset)} pairs")
         except Exception as e:
@@ -90,19 +111,26 @@ def main():
     logger.info(f"Train dataset: {len(train_loader.dataset)} samples")
     logger.info(f"Model: {conf.model.name}")
 
+    # Run pre-training evaluation if enabled and weights are loaded
+    if weights_loaded and conf.train.get("eval_before_training", False) and eval_loader is not None:
+        logger.info("Running pre-training evaluation...")
+        run_eval(model, eval_loader, device, writer, global_step=-1,
+                 num_vis=10, scene_logger=scene_logger, seed=conf.dataset.seed)
+
     # Run eval only
     if args.eval_only and eval_loader is not None:
-        run_eval(model, eval_loader, device, writer, 0, num_vis=10, scene_logger=scene_logger)
+        run_eval(model, eval_loader, device, writer, 0, num_vis=10, scene_logger=scene_logger, seed=conf.dataset.seed)
         writer.close()
         return
 
-    # Train
+    # Main Train Process
     start_iter = 0
     if conf.train.stage == "all":
-        stages = ["detector", "ranker", "covariance"]
+        stages = ["detector", "ranker_covariance"]  # Joint training ranker + covariance
         logger.info(f"Training all stages...")
     else:
         stages = [conf.train.stage]
+        logger.info(f"Training stage: {conf.train.stage}")
 
     for stage in stages:
         trainer = StageTrainer(model, stage, conf, device, writer, scene_logger)

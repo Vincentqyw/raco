@@ -290,7 +290,7 @@ class RankingLoss(nn.Module):
 class CovarianceLoss(nn.Module):
     """Covariance estimator loss (Eq. 6-7 in paper)."""
 
-    def __init__(self, epsilon: float = 1e-6):
+    def __init__(self, epsilon: float = 1e-4):
         super().__init__()
         self.epsilon = epsilon
 
@@ -315,9 +315,26 @@ class CovarianceLoss(nn.Module):
         eps_matrix = self.epsilon * torch.eye(2, device=sigma_error.device)
         sigma_error = sigma_error + eps_matrix
 
+        # Clamp eigenvalues to ensure positive definite
+        # This prevents Cholesky decomposition failures
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(sigma_error)
+            # Force eigenvalues to be positive
+            eigenvalues = torch.clamp(eigenvalues, min=self.epsilon)
+            # Reconstruct covariance matrix with clamped eigenvalues
+            sigma_error = torch.einsum(
+                '...ij,...j,...kj->...ik',
+                eigenvectors, eigenvalues, eigenvectors
+            )
+        except RuntimeError:
+            # If eigenvalue decomposition fails, skip this batch
+            logger.warning(f"Eigenvalue decomposition failed in CovarianceLoss")
+            return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
+
         # Check for NaN/Inf in inputs
         if not torch.isfinite(sigma_error).all():
             logger.warning(f"NaN/Inf in sigma_error in CovarianceLoss")
+            breakpoint()
             return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
 
         try:
@@ -333,6 +350,7 @@ class CovarianceLoss(nn.Module):
         # Check for NaN/Inf in inverse
         if not torch.isfinite(sigma_inv).all() or not torch.isfinite(log_det).all():
             logger.warning(f"NaN/Inf in sigma_inv in CovarianceLoss")
+            breakpoint()
             return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
 
         mahalanobis = torch.einsum('bni,bnij,bnj->bn', reprojection_errors, sigma_inv, reprojection_errors)

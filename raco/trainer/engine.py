@@ -19,7 +19,7 @@ from raco.trainer.model_utils import set_stage_require_grad
 from raco.trainer.losses import compute_detector_loss, compute_ranker_loss, compute_covariance_loss
 from raco.trainer.metrics import (
     log_detector_metrics, log_ranker_metrics, log_covariance_metrics,
-    log_gradients, build_postfix
+    log_ranker_covariance_metrics, log_gradients, build_postfix
 )
 from raco.evaluation import run_eval
 
@@ -81,7 +81,15 @@ class StageTrainer:
         self.max_steps_dict = {
             "detector": self.conf.train.detector_steps,
             "covariance": self.conf.train.covariance_steps,
+            "ranker_covariance": self.conf.train.get("ranker_covariance_steps", 20000),
         }
+
+        # Initialize max_steps for detector/covariance/ranker_covariance stages
+        # Ranker stage will be set in train() method
+        if self.stage in self.max_steps_dict:
+            self.max_steps = self.max_steps_dict[self.stage]
+        else:
+            self.max_steps = None  # Will be set in train() for ranker
 
         self.log_interval = self.conf.train.log_interval
         self.save_interval = self.conf.train.save_interval
@@ -114,6 +122,16 @@ class StageTrainer:
             )
         elif self.stage == "covariance":
             self.cov_loss_fn = CovarianceLoss()
+        elif self.stage == "ranker_covariance":
+            # Joint training of ranker and covariance
+            self.rank_loss_fn = RankingLoss(
+                lambda_ranker=self.conf.model.ranker.get("lambda_ranker", 1.0),
+            )
+            self.cov_loss_fn = CovarianceLoss()
+
+            # Load loss weights for joint training (with defaults)
+            self.lambda_ranker_loss = self.conf.train.get("lambda_ranker_loss", 1.0)
+            self.lambda_covariance_loss = self.conf.train.get("lambda_covariance_loss", 0.1)
 
     def _setup_optimizer(self):
         """Setup optimizer and scheduler."""
@@ -124,8 +142,10 @@ class StageTrainer:
             weight_decay=self.conf.train.weight_decay
         )
 
+        # Setup scheduler (use placeholder T_max for ranker, will be reset in train())
+        T_max = self.max_steps if self.max_steps is not None else 100000
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=self.max_steps, eta_min=1e-6
+            self.optimizer, T_max=T_max, eta_min=1e-6
         )
 
     def _freeze_parameters(self):
@@ -252,8 +272,35 @@ class StageTrainer:
                     pred, self.cov_loss_fn,
                     kpts0, kpts1, kpts0_in_1, kpts1_in_0, H_0to1,
                     mutual_mask_0_to_1, mutual_mask_1_to_0,
-                    nearest_idx_0_to_1, nearest_idx_1_to_0, B
+                    nearest_idx_0_to_1, nearest_idx_1_to_0
                 )
+
+            elif self.stage == "ranker_covariance":
+                # Joint training: compute both losses
+                ranker_loss, ranker_metrics = compute_ranker_loss(
+                    pred, self.rank_loss_fn,
+                    mutual_mask_0_to_1, mutual_mask_1_to_0,
+                    nearest_idx_0_to_1, nearest_idx_1_to_0
+                )
+                cov_loss, cov_metrics = compute_covariance_loss(
+                    pred, self.cov_loss_fn,
+                    kpts0, kpts1, kpts0_in_1, kpts1_in_0, H_0to1,
+                    mutual_mask_0_to_1, mutual_mask_1_to_0,
+                    nearest_idx_0_to_1, nearest_idx_1_to_0
+                )
+                # Apply weights to balance loss magnitudes
+                weighted_ranker_loss = self.lambda_ranker_loss * ranker_loss
+                weighted_cov_loss = self.lambda_covariance_loss * cov_loss
+                loss = weighted_ranker_loss + weighted_cov_loss
+
+                # Include weighted losses in metrics for logging
+                loss_metrics = {
+                    **ranker_metrics,
+                    **cov_metrics,
+                    "weighted_ranker": weighted_ranker_loss.item(),
+                    "weighted_cov": weighted_cov_loss.item(),
+                }
+
             else:
                 loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                 loss_metrics = {}
@@ -297,8 +344,14 @@ class StageTrainer:
         # Set max_steps for ranker stage (requires train_loader)
         if self.stage == "ranker":
             self.max_steps = len(train_loader) * self.conf.train.ranker_epochs
-        else:
+            # Recreate scheduler with correct T_max for ranker stage
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.max_steps, eta_min=1e-6
+            )
+        elif self.stage in self.max_steps_dict:
             self.max_steps = self.max_steps_dict[self.stage]
+        else:
+            raise ValueError(f"Unknown stage: {self.stage}")
 
         self.model.train()
         iteration = start_iter
@@ -328,6 +381,8 @@ class StageTrainer:
                         log_ranker_metrics(self.writer, iteration, loss_metrics)
                     elif self.stage == "covariance":
                         log_covariance_metrics(self.writer, iteration, loss_metrics)
+                    elif self.stage == "ranker_covariance":
+                        log_ranker_covariance_metrics(self.writer, iteration, loss_metrics)
 
                     # Gradient norms
                     if iteration % 500 == 0:
@@ -347,7 +402,7 @@ class StageTrainer:
 
                 # Evaluation
                 if eval_loader is not None and iteration % self.eval_interval == 0:
-                    run_eval(self.model, eval_loader, self.device, self.writer, iteration, scene_logger=self.scene_logger)
+                    run_eval(self.model, eval_loader, self.device, self.writer, iteration, scene_logger=self.scene_logger, seed=self.conf.dataset.seed)
 
         pbar.close()
         return iteration
