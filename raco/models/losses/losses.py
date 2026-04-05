@@ -1,4 +1,4 @@
-"""Loss functions for RaCo training."""
+"""Loss functions for RaCo trainer."""
 
 import torch
 import torch.nn as nn

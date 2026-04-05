@@ -1,5 +1,5 @@
 """
-Evaluation utilities for RaCo training.
+Evaluation utilities for RaCo trainer.
 Extracted from train.py for reusability.
 """
 
