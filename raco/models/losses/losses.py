@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from loguru import logger
 from typing import Tuple, Dict, Optional
 
 
@@ -129,11 +130,12 @@ class DetectorLoss(nn.Module):
         else:
             raise ValueError(f"Unexpected reprojection_errors dim: {reprojection_errors.dim()}")
 
-        # Compute binary rewards based on distance threshold
+        # Use dynamic negative reward (as in compute_reward method)
+        rho_neg = -min(self.rho_neg_max, max(1e-6, self.step * 1e-7))
         rewards = torch.where(
             distances <= self.d_max,
             torch.full_like(distances, self.rho_pos),      # positive reward for inliers
-            torch.full_like(distances, -self.rho_pos)      # negative reward for outliers
+            torch.full_like(distances, rho_neg)            # negative reward for outliers
         )
 
         # Apply valid mask
@@ -216,14 +218,26 @@ class RankingLoss(nn.Module):
         self,
         ranker_scores_a: torch.Tensor,
         ranker_scores_b: torch.Tensor,
-        matches_a: torch.Tensor,
-        matches_b: torch.Tensor,
-        num_keypoints: int = 512,
+        mutual_mask_a: torch.Tensor,
+        nearest_idx_a: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict]:
-        """Compute ranking loss."""
+        """
+        Compute ranking loss (Eq. 4-5 in paper).
+
+        Args:
+            ranker_scores_a: (B, N) ranking scores for keypoints in view A
+            ranker_scores_b: (B, N) ranking scores for keypoints in view B
+            mutual_mask_a: (B, N) boolean mask indicating matched keypoints in A
+            nearest_idx_a: (B, N) indices of corresponding matched keypoints in B
+
+        Returns:
+            loss: Total ranking loss
+            dict: Dictionary with individual loss components
+        """
         B, N = ranker_scores_a.shape
         device = ranker_scores_a.device
 
+        # Compute soft ranks
         if self.has_soft_sort and ranker_scores_a.is_cpu:
             soft_ranks_a = self.soft_rank(
                 ranker_scores_a, direction="ASCENDING",
@@ -237,77 +251,39 @@ class RankingLoss(nn.Module):
             soft_ranks_a = self._soft_rank_approximation(ranker_scores_a)
             soft_ranks_b = self._soft_rank_approximation(ranker_scores_b)
 
-        soft_ranks_a_norm = (soft_ranks_a - 1) / (N - 1 + 1e-8)
-        soft_ranks_b_norm = (soft_ranks_b - 1) / (N - 1 + 1e-8)
+        # Normalize ranks to [0, 1] for numerical stability
+        soft_ranks_a_norm = (soft_ranks_a - 1) / (N - 1 + 1e-8)  # (B, N)
+        soft_ranks_b_norm = (soft_ranks_b - 1) / (N - 1 + 1e-8)  # (B, N)
 
-        # Spearman Loss: Eq. 4 in paper
-        # Lspearman = (1/N) * Σ (hsoft(rmatched_A,i) - hsoft(rmatched_B,i))^2
-        # We normalize by number of matches
-        spearman_loss = 0.0
-        num_matches = matches_a.shape[1]
-        total_valid_matches = 0
-        if num_matches > 0:
-            for b in range(B):
-                # Filter out -1 (padding)
-                valid_mask = matches_a[b] >= 0
-                if valid_mask.sum() == 0:
-                    continue
-                matched_idx_a = matches_a[b][valid_mask]
-                matched_idx_b = matches_b[b][valid_mask]
-                matched_ranks_a = soft_ranks_a_norm[b, matched_idx_a]
-                matched_ranks_b = soft_ranks_b_norm[b, matched_idx_b]
-                if len(matched_ranks_a) > 0:
-                    spearman_loss = spearman_loss + F.mse_loss(matched_ranks_a, matched_ranks_b)
-                    total_valid_matches += len(matched_ranks_a)
-            # Normalize by total matches across batch (matching paper's 1/N)
-            if total_valid_matches > 0:
-                spearman_loss = spearman_loss / total_valid_matches
-            else:
-                spearman_loss = torch.tensor(0.0, device=device)
+        # ========== Spearman Loss (Eq. 4) ==========
+        # Get ranks of matched keypoints using boolean indexing
+        matched_ranks_a = soft_ranks_a_norm[mutual_mask_a]  # (M,) where M = total matches across batch
+
+        if len(matched_ranks_a) > 0:
+            # Get corresponding ranks in view B
+            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # (B, N)
+            matched_idx_b = nearest_idx_a[mutual_mask_a]  # (M,)
+            matched_ranks_b = soft_ranks_b_norm[batch_idx[mutual_mask_a], matched_idx_b]  # (M,)
+
+            # MSE loss on normalized ranks
+            spearman_loss = F.mse_loss(matched_ranks_a, matched_ranks_b)
         else:
-            spearman_loss = torch.tensor(0.0, device=device)
+            spearman_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        # Pull Loss: Eq. 5 in paper
-        # Lipull = |hsoft(riv) - 1| if matched, |hsoft(riv) - N| otherwise
-        # Final: (1/N) * Σ Lipull
-        pull_loss = 0.0
-        total_keypoints = 0
-        for b in range(B):
-            all_indices = torch.arange(N, device=device)
-            matched_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        # ========== Pull Loss (Eq. 5) ==========
+        # Target: matched keypoints → rank 1 (target 0 after normalization)
+        #         unmatched keypoints → rank N (target 1 after normalization)
+        target_a = torch.where(
+            mutual_mask_a,
+            torch.zeros_like(soft_ranks_a_norm),   # matched: pull to rank 1 → target 0
+            torch.ones_like(soft_ranks_a_norm)     # unmatched: pull to rank N → target 1
+        )
 
-            # Filter out -1 padding
-            valid_matches = matches_a[b] >= 0
-            if valid_matches.sum() > 0:
-                matched_mask[matches_a[b][valid_matches]] = True
-            unmatched_indices = all_indices[~matched_mask]
+        # L1 loss averaged over all keypoints
+        pull_loss = F.l1_loss(soft_ranks_a_norm, target_a)
 
-            if valid_matches.sum() > 0:
-                matched_soft_ranks_a = soft_ranks_a_norm[b, matches_a[b][valid_matches]]
-                matched_soft_ranks_b = soft_ranks_b_norm[b, matches_b[b][valid_matches]]
-                pull_loss = pull_loss + (
-                    F.l1_loss(matched_soft_ranks_a, torch.zeros_like(matched_soft_ranks_a)) +
-                    F.l1_loss(matched_soft_ranks_b, torch.zeros_like(matched_soft_ranks_b))
-                )
-                total_keypoints += valid_matches.sum() * 2
-
-            num_unmatched = len(unmatched_indices)
-            if num_unmatched > 0:
-                unmatched_soft_ranks_a = soft_ranks_a_norm[b, unmatched_indices]
-                unmatched_soft_ranks_b = soft_ranks_b_norm[b, unmatched_indices]
-                pull_loss = pull_loss + (
-                    F.l1_loss(unmatched_soft_ranks_a, torch.ones_like(unmatched_soft_ranks_a)) +
-                    F.l1_loss(unmatched_soft_ranks_b, torch.ones_like(unmatched_soft_ranks_b))
-                )
-                total_keypoints += num_unmatched * 2
-
-        # Normalize by N (total keypoints) as per paper
-        if total_keypoints > 0:
-            pull_loss_avg = pull_loss / total_keypoints
-        else:
-            pull_loss_avg = torch.tensor(0.0, device=device)
-
-        total_loss = spearman_loss + self.lambda_ranker * pull_loss_avg
+        # ========== Total Loss ==========
+        total_loss = spearman_loss + self.lambda_ranker * pull_loss
 
         return total_loss, {
             "spearman_loss": spearman_loss.item() if isinstance(spearman_loss, torch.Tensor) else 0.0,
@@ -340,27 +316,52 @@ class CovarianceLoss(nn.Module):
         )
         sigma_error = covariances_a + sigma_b_propagated
 
+        # Add small diagonal for numerical stability
         eps_matrix = self.epsilon * torch.eye(2, device=sigma_error.device)
         sigma_error = sigma_error + eps_matrix
+
+        # Check for NaN/Inf in inputs
+        if not torch.isfinite(sigma_error).all():
+            logger.warning(f"NaN/Inf in sigma_error in CovarianceLoss")
+            return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
 
         try:
             L = torch.linalg.cholesky(sigma_error)
             sigma_inv = torch.cholesky_inverse(L)
             log_det = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1).clamp(min=self.epsilon)).sum(dim=-1)
         except RuntimeError:
-            sigma_inv = torch.inverse(sigma_error)
+            # Cholesky failed, try pseudo-inverse
+            sigma_inv = torch.linalg.pinv(sigma_error)
             det = torch.det(sigma_error)
             log_det = torch.log(det.clamp(min=self.epsilon))
 
+        # Check for NaN/Inf in inverse
+        if not torch.isfinite(sigma_inv).all() or not torch.isfinite(log_det).all():
+            logger.warning(f"NaN/Inf in sigma_inv in CovarianceLoss")
+            return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
+
         mahalanobis = torch.einsum('bni,bnij,bnj->bn', reprojection_errors, sigma_inv, reprojection_errors)
+
+        if not torch.isfinite(mahalanobis).all():
+            logger.warning(f"NaN/Inf in mahalanobis in CovarianceLoss")
+            return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
+
         nll = 0.5 * (log_det + mahalanobis)
 
         if valid_mask is not None:
+            num_valid = valid_mask.sum().item()
+            if num_valid == 0:
+                # No valid matches, return zero loss
+                return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
             nll = nll * valid_mask
-            num_valid = valid_mask.sum().clamp(min=1)
             loss = nll.sum() / num_valid
         else:
             loss = nll.mean()
+
+        # Final check
+        if not torch.isfinite(loss):
+            logger.warning(f"NaN/Inf in loss in CovarianceLoss")
+            return torch.tensor(0.0, device=covariances_a.device, requires_grad=True)
 
         return loss
 
@@ -373,10 +374,29 @@ class CovarianceLoss(nn.Module):
         jacobian_b_to_a: torch.Tensor,
         jacobian_a_to_b: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
+        valid_mask_a_to_b: Optional[torch.Tensor] = None,
+        valid_mask_b_to_a: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict]:
-        """Compute bidirectional covariance loss."""
-        loss_b_to_a = self.forward(covariances_a, covariances_b, errors_b_to_a, jacobian_b_to_a, valid_mask)
-        loss_a_to_b = self.forward(covariances_b, covariances_a, errors_a_to_b, jacobian_a_to_b, valid_mask)
+        """
+        Compute bidirectional covariance loss.
+
+        Args:
+            covariances_a: (B, N, 2, 2) covariance for keypoints in view A
+            covariances_b: (B, N, 2, 2) covariance for keypoints in view B
+            errors_b_to_a: (B, N, 2) reprojection error from B to A
+            errors_a_to_b: (B, N, 2) reprojection error from A to B
+            jacobian_b_to_a: (B, N, 2, 2) Jacobian of homography B->A
+            jacobian_a_to_b: (B, N, 2, 2) Jacobian of homography A->B
+            valid_mask: Deprecated, use valid_mask_a_to_b/valid_mask_b_to_a
+            valid_mask_a_to_b: (B, N) mask for A->B direction (mutual_match from 0 to 1)
+            valid_mask_b_to_a: (B, N) mask for B->A direction (mutual_match from 1 to 0)
+        """
+        # Support both deprecated single mask and new dual mask
+        mask_a_to_b = valid_mask_a_to_b if valid_mask_a_to_b is not None else valid_mask
+        mask_b_to_a = valid_mask_b_to_a if valid_mask_b_to_a is not None else valid_mask
+
+        loss_b_to_a = self.forward(covariances_a, covariances_b, errors_b_to_a, jacobian_b_to_a, mask_b_to_a)
+        loss_a_to_b = self.forward(covariances_b, covariances_a, errors_a_to_b, jacobian_a_to_b, mask_a_to_b)
         total_loss = (loss_b_to_a + loss_a_to_b) / 2
 
         return total_loss, {

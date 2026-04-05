@@ -52,15 +52,20 @@ def create_heatmap_figname(
     colorbar_label: str = "",
 ) -> torch.Tensor:
     """Create a heatmap visualization figure."""
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
     fig, ax = plt.subplots(figsize=(8, 6))
 
     im = ax.imshow(heatmap, cmap=cmap, aspect="auto")
     ax.set_title(title)
     ax.axis("off")
 
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # Use make_axes_locatable for proper colorbar alignment
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad="3%")
+    cbar = plt.colorbar(im, cax=cax)
     if colorbar_label:
-        cbar.set_label(colorbar_label)
+        cbar.set_label(colorbar_label, rotation=270, labelpad=15)
 
     fig.tight_layout()
     return figure_to_tensor(fig)
@@ -73,6 +78,8 @@ def create_overlay_figure(
     title: str = "Overlay",
 ) -> torch.Tensor:
     """Overlay heatmap on RGB image."""
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
     fig, ax = plt.subplots(figsize=(8, 6))
 
     # Convert image to numpy [H, W, 3]
@@ -86,7 +93,10 @@ def create_overlay_figure(
     ax.set_title(title)
     ax.axis("off")
 
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # Use make_axes_locatable for proper colorbar alignment
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad="3%")
+    plt.colorbar(im, cax=cax)
     fig.tight_layout()
     return figure_to_tensor(fig)
 
@@ -97,16 +107,21 @@ def create_covariance_figures(
     cmaps: List[str] = ["viridis", "RdBu_r", "plasma"],
 ) -> Dict[str, torch.Tensor]:
     """
-    Create visualization for covariance Cholesky factors.
+    Create visualization for covariance as ellipse visualization.
+
+    Color represents the major axis angle of covariance ellipse.
+    Intensity is weighted by |Σ| (determinant), with higher uncertainty appearing whiter.
 
     Args:
-        cov_map: Tensor of shape [H, W, 3] containing (L11, L21, L22)
+        cov_map: Tensor of shape [H, W, 3] containing (L11, L21, L22) Cholesky factors
         title_prefix: Prefix for figure titles
-        cmaps: List of colormaps for each channel
+        cmaps: List of colormaps (not used, kept for compatibility)
 
     Returns:
         Dictionary mapping channel names to figure tensors
     """
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
     if isinstance(cov_map, torch.Tensor):
         cov_map = cov_map.cpu().numpy()
 
@@ -117,32 +132,97 @@ def create_covariance_figures(
     H, W, C = cov_map.shape
     assert C == 3, f"Expected 3 channels, got {C}"
 
-    channel_names = ["L11 (var_x)", "L21 (cov_xy)", "L22 (var_y)"]
-    results = {}
+    # Extract Cholesky factors
+    L11 = cov_map[..., 0]  # sqrt(var_x)
+    L21 = cov_map[..., 1]  # cov_xy / sqrt(var_x)
+    L22 = cov_map[..., 2]  # sqrt(var_y)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    # Reconstruct covariance matrices: Σ = L @ L.T
+    # L = [[L11,  0 ],
+    #      [L21, L22]]
+    # Σ = [[L11^2,        L11*L21],
+    #      [L11*L21, L21^2+L22^2]]
 
-    for i, (name, cmap) in enumerate(zip(channel_names, cmaps)):
-        ax = axes[i]
-        data = cov_map[..., i]
+    Sigma_00 = L11 ** 2
+    Sigma_01 = L11 * L21
+    Sigma_11 = L21 ** 2 + L22 ** 2
 
-        # Use symmetric normalization for L21 (can be negative)
-        if i == 1:
-            vmax = np.abs(data).max()
-            vmin = -vmax
-        else:
-            vmin, vmax = data.min(), data.max()
+    # Compute eigenvalues for each pixel
+    # λ = (trace ± sqrt(trace^2 - 4*det)) / 2
+    trace = Sigma_00 + Sigma_11
+    det = Sigma_00 * Sigma_11 - Sigma_01 ** 2
 
-        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
-        ax.set_title(f"{name}")
-        ax.axis("off")
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    # Discriminant (ensure non-negative for numerical stability)
+    disc = np.maximum(trace ** 2 - 4 * det, 0)
+    sqrt_disc = np.sqrt(disc)
 
-    fig.suptitle(f"{title_prefix} - Cholesky Factors", fontsize=14)
+    # Eigenvalues: λ1 >= λ2
+    lambda_1 = (trace + sqrt_disc) / 2  # Major eigenvalue
+    lambda_2 = (trace - sqrt_disc) / 2  # Minor eigenvalue
+
+    # Major axis angle: θ = 0.5 * atan2(2*σ_01, σ_00 - σ_11)
+    # Range: [-π/2, π/2]
+    angle = 0.5 * np.arctan2(2 * Sigma_01, Sigma_00 - Sigma_11)
+
+    # Normalize angle to [0, 1] for colormap
+    # Angle range [-π/2, π/2] -> [0, 1]
+    angle_normalized = (angle + np.pi / 2) / np.pi
+
+    # Weight by determinant |Σ|: higher uncertainty = whiter
+    # Normalize determinant to [0, 1]
+    det_normalized = det / (det.max() + 1e-8)
+
+    # Create HSV image: Hue from angle, Value weighted by det
+    # Higher det (more uncertainty) -> lower value (whiter in final image)
+    # Use HSV colormap for angles
+    from matplotlib.colors import hsv_to_rgb
+
+    # Hue: angle (0-1)
+    hue = angle_normalized
+
+    # Saturation: always full
+    saturation = np.ones_like(hue)
+
+    # Value: inverse of uncertainty (high det -> low value -> whiter)
+    value = 1.0 - det_normalized * 0.7  # Scale to keep some visibility
+
+    # Stack to HSV
+    hsv = np.stack([hue, saturation, value], axis=-1)
+    rgb = hsv_to_rgb(hsv)
+
+    # Create figure with consistent size
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    im = ax.imshow(rgb, aspect="auto")
+    ax.set_title(f"{title_prefix}\nColor: Major axis angle | Brightness: |Σ| (whiter=higher uncertainty)",
+                 fontsize=10)
+    ax.axis("off")
+
+    # Use make_axes_locatable for consistent colorbar width (5%)
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad="3%")
+
+    # Create angle reference gradient
+    angle_gradient = np.linspace(0, 1, 256).reshape(-1, 1)
+    angle_gradient = np.repeat(angle_gradient, 20, axis=1)
+
+    hue_ref = angle_gradient
+    sat_ref = np.ones_like(angle_gradient)
+    val_ref = np.ones_like(angle_gradient)
+    hsv_ref = np.stack([hue_ref, sat_ref, val_ref], axis=-1)
+    rgb_ref = hsv_to_rgb(hsv_ref)
+
+    cax.imshow(rgb_ref, aspect="auto", origin="lower", extent=[0, 1, -90, 90])
+    cax.set_ylabel("Major Axis Angle (°)", fontsize=9)
+    cax.set_xticks([])
+    cax.yaxis.tick_right()
+    cax.yaxis.set_label_position("right")
+    cax.tick_params(labelsize=8)
+
     fig.tight_layout()
 
     tensor = figure_to_tensor(fig)
-    results["combined"] = tensor
+    results = {"combined": tensor}
 
     return results
 
@@ -155,7 +235,9 @@ def create_keypoints_overlay_figure(
     max_kpts: int = 500,
 ) -> torch.Tensor:
     """Create keypoints overlay on image."""
-    fig, ax = plt.subplots(figsize=(10, 8))
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    fig, ax = plt.subplots(figsize=(8, 6))
 
     # Convert image
     if isinstance(image, torch.Tensor):
@@ -190,7 +272,11 @@ def create_keypoints_overlay_figure(
             s=10,
             alpha=0.7,
         )
-        plt.colorbar(scatter, ax=ax, label="Score")
+        # Use make_axes_locatable for proper colorbar alignment
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad="3%")
+        cbar = plt.colorbar(scatter, cax=cax)
+        cbar.set_label("Score", rotation=270, labelpad=15)
     else:
         ax.scatter(kpts_np[:, 0], kpts_np[:, 1], c="lime", s=10, alpha=0.7)
 
@@ -261,12 +347,11 @@ class EnhancedTensorBoardLogger:
 
         tag_prefix = f"scenes/{seq_name}/{img_idx.item()}"
 
-        # 1. Log RGB image
+        # Get reference image for overlays
         img0 = data["image0"]["image"][0]  # [3, H, W]
         img_denorm = denormalize_image(img0)
-        self.writer.add_image(f"{tag_prefix}/rgb", img_denorm, global_step)
 
-        # 2. Log prob_map heatmap (detection probability)
+        # 1. Log prob_map heatmap (detection probability)
         if "prob_map" in pred.get("image0", {}):
             prob_map = pred["image0"]["prob_map"][0, 0].cpu().numpy()  # [H, W]
 
@@ -288,7 +373,7 @@ class EnhancedTensorBoardLogger:
             )
             self.writer.add_image(f"{tag_prefix}/prob_overlay", overlay_fig, global_step)
 
-        # 3. Log ranker score map if available
+        # 2. Log ranker score map if available
         if "ranker_scores" in pred.get("image0", {}):
             # Ranker scores are per-keypoint, need to scatter to image
             ranker_scores = pred["image0"]["ranker_scores"][0].cpu().numpy()  # [N]
@@ -309,7 +394,7 @@ class EnhancedTensorBoardLogger:
                 )
                 self.writer.add_image(f"{tag_prefix}/ranker_map", ranker_fig, global_step)
 
-        # 4. Log covariance maps if available
+        # 3. Log covariance maps if available
         if "covariances" in pred.get("image0", {}):
             covariances = pred["image0"]["covariances"][0].cpu().numpy()  # [N, 2, 2]
             keypoints = pred["image0"]["keypoints"][0].cpu().numpy()  # [N, 2]
@@ -338,7 +423,7 @@ class EnhancedTensorBoardLogger:
                     f"{tag_prefix}/covariance_maps", cov_figs["combined"], global_step
                 )
 
-        # 5. Log keypoints overlay
+        # 4. Log keypoints overlay
         keypoints = pred["keypoints_0"][0]  # [N, 2]
         if "keypoint_scores_0" in pred:
             scores = pred["keypoint_scores_0"][0]  # [N]

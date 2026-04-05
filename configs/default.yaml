@@ -10,7 +10,7 @@ dataset:
   val_size: 200
   batch_size: 2
   num_workers: 8
-  seed: 0
+  seed: 1
   pin_memory: true          # Faster CPU->GPU transfer
   persistent_workers: true  # Avoid worker recreation
   homography:
@@ -26,7 +26,7 @@ dataset:
 # Model configuration
 model:
   name: raco
-  max_num_keypoints: 480
+  max_num_keypoints: 256
   nms_radius: 3
   subpixel_sampling: true
   subpixel_temp: 0.5
@@ -42,18 +42,18 @@ model:
 
 # Training configuration
 train:
-  stage: all
+  stage: all  # detector, ranker, covariance, all
   lr: 2.0e-4                # Reduced from 2e-4 for stability
   weight_decay: 1.0e-6
   detector_steps: 20000
   ranker_epochs: 1
   covariance_steps: 20000
-  log_interval: 10          # More frequent logging for debugging
+  log_interval: 10            # More frequent logging for debugging
   save_interval: 1000
-  eval_interval: 1000      # Less frequent eval for speed
+  eval_interval: 1000         # Less frequent eval for speed
   eval_during_training: true  # Disable during initial debugging
-  use_amp: false             # Mixed precision training
-  compile: false            # torch.compile() (PyTorch 2.0+)
+  use_amp: false              # Mixed precision training
+  compile: false              # torch.compile() (PyTorch 2.0+)
 
 # Output configuration
 output:
@@ -65,5 +65,5 @@ eval:
   batch_size: 1
   num_workers: 8
   # Fast eval options (set to null for full evaluation)
-  max_scenes: 4        # Limit number of scenes (e.g., 10 for quick eval)
+  max_scenes: 5        # Limit number of scenes (e.g., 10 for quick eval)
   max_pairs_per_scene: 1  # Limit pairs per scene (e.g., 2 for quick eval)

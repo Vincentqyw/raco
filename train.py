@@ -9,7 +9,6 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from loguru import logger
 from omegaconf import OmegaConf
@@ -62,6 +61,42 @@ def find_matches(kpts_a, kpts_b, H, threshold=3.0):
     return torch.tensor(matches_a, device=kpts_a.device), \
            torch.tensor(matches_b, device=kpts_b.device)
 
+
+def compute_mutual_dist(kpts0_trans, kpts1, threshold=3.0):
+    """
+    Compute Mutual Nearest Neighbors (MNN) between two point sets.
+
+    Args:
+        kpts0_trans: Keypoints from view 0 projected to view 1 coordinates (B, N0, 2)
+        kpts1: Keypoints from view 1 (B, N1, 2)
+        threshold: Maximum Euclidean distance to be considered a valid match
+
+    Returns:
+        mutual_mask: Boolean mask (B, N0), indicating which kpts0 have valid MNN
+        nearest_idx: Corresponding kpts1 indices (B, N0)
+        dist01: Nearest neighbor distances (B, N0)
+    """
+    B, N0, _ = kpts0_trans.shape
+    device = kpts0_trans.device
+
+    # 1. Compute pairwise distance matrix (B, N0, N1)
+    dist_mat = torch.cdist(kpts0_trans, kpts1)
+
+    # 2. Compute bidirectional nearest neighbors
+    # kpts0's nearest neighbor in kpts1
+    dist01, idx01 = dist_mat.min(dim=2)  # (B, N0)
+    # kpts1's nearest neighbor in kpts0
+    dist10, idx10 = dist_mat.min(dim=1)  # (B, N1) - unused
+
+    # 3. Mutual nearest neighbor check
+    # For each kpts0[i], check if kpts1[nn(i)]'s nearest neighbor is i
+    target = torch.arange(N0, device=device).unsqueeze(0).expand(B, -1)
+    rev_idx = idx10.gather(1, idx01)  # (B, N0)
+
+    # 4. Generate mask: (index match) AND (distance < threshold)
+    mutual_mask = (rev_idx == target) & (dist01 < threshold)
+
+    return mutual_mask, idx01, dist01
 
 def run_eval(model, eval_loader, device, writer, global_step, num_vis=5, scene_logger=None):
     """Run evaluation and log to tensorboard."""
@@ -190,9 +225,8 @@ def set_stage_require_grad(model, stage):
     logger.info(f"Stage '{stage}' - Trainable params: {trainable}")
 
 
-def train_model(model, train_loader, eval_loader, device, conf, writer, start_iter=0, scene_logger=None):
+def train_model(model, train_loader, eval_loader, device, conf, writer, stage = "detector", start_iter=0, scene_logger=None):
     """Training loop with eval."""
-    stage = conf.train.stage
     max_steps = {
         "detector": conf.train.detector_steps,
         "ranker": len(train_loader) * conf.train.ranker_epochs,
@@ -271,52 +305,61 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                 kpts1 = pred["keypoints_1"]
                 H_0to1 = batch["H_0to1"]
 
-                # Transform keypoints
+                # Skip batches with degenerate homographies (before transformation)
+                # H_max = H_0to1.abs().max().item()
+                # if H_max > 100:  # Reasonable threshold
+                #     if iteration % 100 == 0:  # Log occasionally to avoid spam
+                #         logger.warning(f"Skipping batch {iteration}: Homography values too large (max={H_max:.1f})")
+                #     continue
+
+                # Transform keypoints (outputs float32 for numerical stability)
                 kpts0_in_1 = transform_points_with_homography(kpts0, H_0to1)
                 kpts1_in_0 = transform_points_with_homography(kpts1, torch.inverse(H_0to1))
+
+                # Check for NaN/Inf immediately after transformation (early detection)
+                if not torch.isfinite(kpts0_in_1).all() or not torch.isfinite(kpts1_in_0).all():
+                    logger.warning(f"Skipping batch {iteration}: NaN/Inf in homography transformation")
+                    logger.warning(f"  H_0to1 range: [{H_0to1.min().item():.4f}, {H_0to1.max().item():.4f}]")
+                    logger.warning(f"  kpts0 range: [{kpts0.min().item():.4f}, {kpts0.max().item():.4f}]")
+                # breakpoint()
+                    continue
 
                 # Compute distance to nearest neighbor (matching the paper's definition)
                 # For each kpts0_in_1, find nearest neighbor in kpts1, then compute distance
                 # This is: d(xiA) = ||H_A→B(xiA) - NN(H_A→B(xiA))||
-
-                # Pairwise distances between kpts0_in_1 and kpts1 (B, N, N)
-                # Reused for detector, ranker, and covariance losses
-                dist_mat_0to1 = torch.cdist(kpts0_in_1, kpts1)
-                distances_0_to_1, nearest_idx_0_to_1 = dist_mat_0to1.min(dim=2)  # (B, N)
-
-                # Pairwise distances between kpts1_in_0 and kpts0 (B, N, N)
-                dist_mat_1to0 = torch.cdist(kpts1_in_0, kpts0)
-                distances_1_to_0, nearest_idx_1_to_0 = dist_mat_1to0.min(dim=2)  # (B, N)
-
-                # For covariance loss, compute mutual nearest neighbor matches
-                # This gives us M - the set of ground truth matches (Eq. 7)
-                min_dist_0to1, matches_0to1 = dist_mat_0to1.min(dim=2)
-                _, matches_1to0 = dist_mat_1to0.min(dim=1)
-
-                # Create valid match mask: mutual nearest neighbors within threshold
                 match_threshold = 3.0
-                mutual_match_mask = (matches_1to0.gather(1, matches_0to1) ==
-                                   torch.arange(kpts0.shape[1], device=kpts0.device).unsqueeze(0)) & \
-                                   (min_dist_0to1 < match_threshold)
-
-                # Compute reprojection error vectors for covariance loss (not for detector loss)
-                # Gather the nearest neighbor keypoints
-                batch_idx = torch.arange(B, device=kpts0.device).unsqueeze(1).expand(-1, kpts0.shape[1])
-                nearest_kpts1 = kpts1[batch_idx, nearest_idx_0_to_1]  # (B, N, 2)
-                nearest_kpts0 = kpts0[batch_idx, nearest_idx_1_to_0]  # (B, N, 2)
-
-                # Error vectors (for covariance loss) - (B, N, 2) for einsum
-                errors_0_to_1 = (kpts0_in_1 - nearest_kpts1)  # (B, N, 2)
-                errors_1_to_0 = (kpts1_in_0 - nearest_kpts0)  # (B, N, 2)
+                mutual_mask_0_to_1, nearest_idx_0_to_1, distances_0_to_1 = compute_mutual_dist(kpts0_in_1, kpts1, threshold=match_threshold)
+                mutual_mask_1_to_0, nearest_idx_1_to_0, distances_1_to_0 = compute_mutual_dist(kpts1_in_0, kpts0, threshold=match_threshold)
 
                 valid_0_to_1 = get_valid_mask(kpts0_in_1, H, W)
                 valid_1_to_0 = get_valid_mask(kpts1_in_0, H, W)
 
                 # Check for NaN/Inf in reprojection errors before loss computation
-                if not torch.isfinite(errors_0_to_1).all() or not torch.isfinite(errors_1_to_0).all():
+                if not torch.isfinite(distances_0_to_1).all() or not torch.isfinite(distances_1_to_0).all():
                     logger.warning(f"Skipping batch {iteration}: NaN/Inf in reprojection errors")
-                    breakpoint()
                     continue
+                # breakpoint()
+
+
+                # Debug: visualize training matches
+                if iteration % 100 == 0:
+                    from visualize_training_matches import visualize_training_batch, visualize_homography_effect
+                    visualize_training_batch(
+                        batch, pred,
+                        kpts0_in_1, kpts1_in_0,
+                        kpts0, kpts1,
+                        mutual_mask_0_to_1, mutual_mask_1_to_0,
+                        nearest_idx_0_to_1, nearest_idx_1_to_0,
+                        valid_0_to_1, valid_1_to_0,
+                        iteration=iteration,
+                        save_dir=str(Path(conf.output.output_dir) / "debug_training_matches")
+                    )
+                    visualize_homography_effect(
+                        batch, pred, kpts0, H_0to1,
+                        iteration=iteration,
+                        save_dir=str(Path(conf.output.output_dir) / "debug_training_matches")
+                    )
+                    # breakpoint()
 
                 # Compute loss based on stage
                 if stage == "detector":
@@ -325,7 +368,6 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                     prob_1_sparse = pred["image1"]["keypoint_scores"]
 
                     # Compute loss on sparse samples (pass distances, not error vectors)
-                    # detector loss expects (B, N) or (B, N, 2)
                     loss_0, loss_0_details = det_loss_fn.forward_sparse(prob_0_sparse, distances_0_to_1, valid_0_to_1)
                     loss_1, loss_1_details = det_loss_fn.forward_sparse(prob_1_sparse, distances_1_to_0, valid_1_to_0)
                     loss = (loss_0 + loss_1) / 2.0
@@ -335,62 +377,28 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
 
                     # Debug: check if loss is 0 and why (now handled by early exit)
                     if loss.item() == 0 and iteration % 10 == 0:
-                        distances0 = detector_loss_0_rewards['distances']
-                        distances1 = detector_loss_1_rewards['distances']
+                        distances0 = loss_0_details['distances']
+                        distances1 = loss_1_details['distances']
                         logger.info(
                             f"Zero loss at iter {iteration}: valid_ratio={valid_0_to_1.float().mean():.3f}, "
                             f"prob_mean={prob_0_sparse.mean():.6f}, ",
                             f"distances0={distances0.mean():.6f}, ",
                             f"distances1={distances1.mean():.6f}",
                         )
-                        breakpoint()
+                        # breakpoint()
+                        continue
 
                     det_loss_fn.set_step(iteration)
 
                 elif stage == "ranker":
-                    # Ranking loss using soft ranking (reuses dist_mat computed earlier)
-
+                    # Ranking loss using soft ranking (reuses mutual_dist computed earlier)
                     ranker_scores_0 = pred["ranker_scores_0"]  # (B, N)
                     ranker_scores_1 = pred["ranker_scores_1"]
 
-                    # Mutual nearest neighbors from precomputed pairwise distances
-                    min_dist_0to1, matches_0to1 = dist_mat_0to1.min(dim=2)
-                    _, matches_1to0 = dist_mat_1to0.min(dim=1)
-
-                    matches_a = []
-                    matches_b = []
-                    for b in range(B):
-                        valid_matches = []
-                        for i in range(kpts0.shape[1]):
-                            j = matches_0to1[b, i]
-                            if matches_1to0[b, j] == i and min_dist_0to1[b, i] < 3.0:
-                                valid_matches.append((i, j))
-                        if valid_matches:
-                            ma, mb = zip(*valid_matches)
-                            matches_a.append(torch.tensor(ma, device=device))
-                            matches_b.append(torch.tensor(mb, device=device))
-                        else:
-                            matches_a.append(torch.tensor([], device=device, dtype=torch.long))
-                            matches_b.append(torch.tensor([], device=device, dtype=torch.long))
-
-                    # Pad to same length for batching
-                    max_matches = max(len(m) for m in matches_a) if matches_a else 0
-                    if max_matches > 0:
-                        matches_a_padded = torch.full((B, max_matches), -1, device=device, dtype=torch.long)
-                        matches_b_padded = torch.full((B, max_matches), -1, device=device, dtype=torch.long)
-                        for b in range(B):
-                            n = len(matches_a[b])
-                            if n > 0:
-                                matches_a_padded[b, :n] = matches_a[b]
-                                matches_b_padded[b, :n] = matches_b[b]
-                    else:
-                        matches_a_padded = torch.full((B, 1), -1, device=device, dtype=torch.long)
-                        matches_b_padded = torch.full((B, 1), -1, device=device, dtype=torch.long)
-
-                    loss, _ = rank_loss_fn(
-                        ranker_scores_0, ranker_scores_1,
-                        matches_a_padded, matches_b_padded,
-                    )
+                    # Pass mutual_mask directly to loss function
+                    loss_0_to_1, _ = rank_loss_fn(ranker_scores_0, ranker_scores_1,mutual_mask_a=mutual_mask_0_to_1,nearest_idx_a=nearest_idx_0_to_1)
+                    loss_1_to_0, _ = rank_loss_fn(ranker_scores_1, ranker_scores_0,mutual_mask_a=mutual_mask_1_to_0,nearest_idx_a=nearest_idx_1_to_0)
+                    loss = (loss_0_to_1 + loss_1_to_0) / 2.0
 
                 elif stage == "covariance":
                     # Covariance loss using reprojection error (Eq. 6-7 in paper)
@@ -402,12 +410,22 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                     jacobian_0_to_1 = compute_homography_jacobian(H_0to1, kpts0)
                     jacobian_1_to_0 = compute_homography_jacobian(torch.inverse(H_0to1), kpts1)
 
-                    # Compute bidirectional loss only on matched keypoints
+                    # # Compute reprojection error vectors for covariance loss (not for detector loss)
+                    batch_idx = torch.arange(B, device=kpts0.device).unsqueeze(1).expand(-1, kpts0.shape[1])
+                    nearest_kpts1 = kpts1[batch_idx, nearest_idx_0_to_1]  # (B, N, 2)
+                    nearest_kpts0 = kpts0[batch_idx, nearest_idx_1_to_0]  # (B, N, 2)
+
+                    # Error vectors (for covariance loss) - (B, N, 2) for einsum
+                    errors_0_to_1 = (kpts0_in_1 - nearest_kpts1)  # (B, N, 2)
+                    errors_1_to_0 = (kpts1_in_0 - nearest_kpts0)  # (B, N, 2)
+
+                    # Compute bidirectional loss with separate masks for each direction
                     loss, _ = cov_loss_fn.forward_bidirectional(
                         covariances_0, covariances_1,
                         errors_0_to_1, errors_1_to_0,
                         jacobian_0_to_1, jacobian_1_to_0,
-                        valid_mask=mutual_match_mask,
+                        valid_mask_a_to_b=mutual_mask_0_to_1,
+                        valid_mask_b_to_a=mutual_mask_1_to_0,
                     )
 
                 else:
@@ -438,9 +456,9 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
                 if stage == "detector":
                     writer.add_scalar(f"{stage}/reward_0_mean", detector_loss_0_rewards.mean().item(), iteration)
                     writer.add_scalar(f"{stage}/reward_0_std", detector_loss_0_rewards.std().item(), iteration)
+                    writer.add_scalar(f"{stage}/reward_1_mean", detector_loss_1_rewards.mean().item(), iteration)
                     writer.add_scalar(f"{stage}/reward_1_std", detector_loss_1_rewards.std().item(), iteration)
-                    writer.add_scalar(f"{stage}/reward_1_std", detector_loss_1_rewards.std().item(), iteration)
-                    writer.add_scalar(f"{stage}/valid_ratio", valid_0_to_1.float().mean().item(), iteration)
+                    writer.add_scalar(f"{stage}/mutual_ratio", mutual_mask_0_to_1.float().mean().item(), iteration)
 
                 # Debug: log gradient norms every 500 iterations
                 if stage == "detector" and iteration % 500 == 0:
@@ -488,7 +506,7 @@ def train_model(model, train_loader, eval_loader, device, conf, writer, start_it
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--conf", type=str, default="configs/default.yaml")
-    parser.add_argument("--stage", type=str, default="detector",
+    parser.add_argument("-s", "--stage", type=str, default="detector",
                         choices=["detector", "ranker", "covariance", "all"])
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--eval_only", action="store_true", help="Run eval only")
@@ -496,7 +514,6 @@ def main():
 
     # Load config
     conf = OmegaConf.load(args.conf)
-    conf.train.stage = args.stage
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -565,14 +582,14 @@ def main():
 
     # Train
     start_iter = 0
-    if args.stage == "all":
+    if conf.train.stage == "all":
         stages = ["detector", "ranker", "covariance"]
+        logger.info(f"Training all stages...")
     else:
-        stages = [args.stage]
+        stages = [conf.train.stage]
 
     for stage in stages:
-        conf.train.stage = stage
-        start_iter = train_model(model, train_loader, eval_loader, device, conf, writer, start_iter, scene_logger)
+        start_iter = train_model(model, train_loader, eval_loader, device, conf, writer, stage, start_iter, scene_logger)
 
         ckpt_path = output_dir / f"{stage}_final.pth"
         torch.save(model.state_dict(), ckpt_path)

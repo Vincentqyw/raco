@@ -58,25 +58,38 @@ def transform_points_with_homography(
     epsilon: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Transform points using homography.
+    Transform points using homography with numerical stability.
+
+    This operation is sensitive to float16 precision issues during AMP training,
+    so we force float32 computation and KEEP float32 output to avoid overflow.
 
     Args:
         points: (B, N, 2) points in pixel coordinates
         homography: (B, 3, 3) homography matrix
 
     Returns:
-        Transformed points (B, N, 2)
+        Transformed points (B, N, 2) - always in float32 for numerical stability
     """
     B, N, _ = points.shape
     device = points.device
 
-    ones = torch.ones(B, N, 1, device=device)
+    # Force float32 for numerical stability (critical for AMP training)
+    # Keep output in float32 to prevent overflow when homography has large values
+    points = points.float()
+    homography = homography.float()
+
+    ones = torch.ones(B, N, 1, device=device, dtype=torch.float32)
     points_h = torch.cat([points, ones], dim=-1)
 
     transformed_h = torch.einsum('bij,bnj->bni', homography, points_h)
-    w = transformed_h[..., 2:3].clamp(min=epsilon)
-    transformed = transformed_h[..., :2] / w
 
+    # Use additive epsilon (following glue-factory) instead of clamp
+    # This is the key difference: add eps to denominator, not clamp w
+    w = transformed_h[..., 2:3]
+    transformed = transformed_h[..., :2] / (w + epsilon)
+
+    # Keep output in float32 to maintain numerical stability
+    # Subsequent operations should handle float32 gracefully
     return transformed
 
 
