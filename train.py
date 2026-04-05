@@ -35,7 +35,7 @@ def load_weights(model, args, conf, device):
     weight_path = args.resume if args.resume else conf.model.get("weights", None)
     if weight_path:
         logger.info(f"Loading weights from {weight_path}")
-        model.load_state_dict(torch.load(weight_path, map_location=device))
+        model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=True))
         return True
     return False
 

@@ -122,13 +122,16 @@ def compute_covariance_loss(
     kpts0_in_1: torch.Tensor,
     kpts1_in_0: torch.Tensor,
     H_0to1: torch.Tensor,
-    mutual_mask_0_to_1: torch.Tensor,
-    mutual_mask_1_to_0: torch.Tensor,
+    mask_0_to_1: torch.Tensor,
+    mask_1_to_0: torch.Tensor,
     nearest_idx_0_to_1: torch.Tensor,
     nearest_idx_1_to_0: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict]:
     """
-    Compute covariance loss using reprojection error.
+    Compute covariance loss - OPTIMIZED with early masking.
+
+    Key improvement: Extract matched keypoints BEFORE expensive operations.
+    This avoids computing eigendecomposition, Cholesky, etc. on unmatched keypoints.
 
     Args:
         pred: Model predictions dict
@@ -138,8 +141,8 @@ def compute_covariance_loss(
         kpts0_in_1: Keypoints 0 projected to view 1 (B, N, 2)
         kpts1_in_0: Keypoints 1 projected to view 0 (B, N, 2)
         H_0to1: Homography from 0 to 1 (3, 3)
-        mutual_mask_0_to_1: Mutual match mask (B, N)
-        mutual_mask_1_to_0: Mutual match mask (B, N)
+        mask_0_to_1: Mutual match mask (B, N)
+        mask_1_to_0: Mutual match mask (B, N)
         nearest_idx_0_to_1: Nearest neighbor indices (B, N)
         nearest_idx_1_to_0: Nearest neighbor indices (B, N)
 
@@ -148,38 +151,153 @@ def compute_covariance_loss(
     """
     covariances_0 = pred["covariances_0"]  # (B, N, 2, 2)
     covariances_1 = pred["covariances_1"]
+    B, N = covariances_0.shape[:2]
+    device = covariances_0.device
 
-    B = covariances_0.shape[0]
+    # ========== Compute Jacobians for ALL keypoints first ==========
+    # (This is still O(N), but much cheaper than eigendecomposition/Cholesky)
 
-    # Compute Jacobians
-    jacobian_0_to_1 = compute_homography_jacobian(H_0to1, kpts0)
-    jacobian_1_to_0 = compute_homography_jacobian(torch.inverse(H_0to1), kpts1)
+    # Handle different H_0to1 shapes:
+    # - (3, 3): single homography
+    # - (B, 3, 3): batched homographies
+    # - (1, B, 3, 3): dataloader format with outer dimension
+    if H_0to1.dim() == 4:
+        # Dataloader format: (1, B, 3, 3) -> (B, 3, 3)
+        H_0to1_batched = H_0to1.squeeze(0)  # (B, 3, 3)
+    elif H_0to1.dim() == 2:
+        # Single homography: (3, 3) -> (B, 3, 3)
+        H_0to1_batched = H_0to1.unsqueeze(0).expand(B, -1, -1)
+    else:
+        # Already batched: (B, 3, 3)
+        H_0to1_batched = H_0to1
 
-    # Compute reprojection error vectors
-    batch_idx = torch.arange(B, device=kpts0.device).unsqueeze(1).expand(-1, kpts0.shape[1])
-    nearest_kpts1 = kpts1[batch_idx, nearest_idx_0_to_1]  # (B, N, 2)
-    nearest_kpts0 = kpts0[batch_idx, nearest_idx_1_to_0]  # (B, N, 2)
+    H_1to0_batched = torch.inverse(H_0to1_batched)  # (B, 3, 3)
 
-    # Error vectors (B, N, 2)
-    errors_0_to_1 = kpts0_in_1 - nearest_kpts1
-    errors_1_to_0 = kpts1_in_0 - nearest_kpts0
+    jacobian_0_to_1_all = compute_homography_jacobian(H_0to1_batched, kpts0)  # (B, N, 2, 2)
+    jacobian_1_to_0_all = compute_homography_jacobian(H_1to0_batched, kpts1)  # (B, N, 2, 2)
 
-    # Compute bidirectional loss with separate masks
-    loss, details = cov_loss_fn.forward_bidirectional(
-        covariances_0, covariances_1,
-        errors_0_to_1, errors_1_to_0,
-        jacobian_0_to_1, jacobian_1_to_0,
-        valid_mask_a_to_b=mutual_mask_0_to_1,
-        valid_mask_b_to_a=mutual_mask_1_to_0,
+    # ========== Direction: View 0 → View 1 ==========
+    loss_0_to_1, loss_0_to_1_metrics = _extract_matched_keypoints_for_covariance(
+        mask=mask_0_to_1,
+        covariances_src=covariances_0,
+        kpts_src_in_tgt=kpts0_in_1,
+        covariances_tgt=covariances_1,
+        kpts_tgt=kpts1,
+        nearest_idx=nearest_idx_0_to_1,
+        jacobian_all=jacobian_0_to_1_all,
+        cov_loss_fn=cov_loss_fn,
+        N=N,
     )
 
+    # ========== Direction: View 1 → View 0 ==========
+    loss_1_to_0, loss_1_to_0_metrics = _extract_matched_keypoints_for_covariance(
+        mask=mask_1_to_0,
+        covariances_src=covariances_1,
+        kpts_src_in_tgt=kpts1_in_0,
+        covariances_tgt=covariances_0,
+        kpts_tgt=kpts0,
+        nearest_idx=nearest_idx_1_to_0,
+        jacobian_all=jacobian_1_to_0_all,
+        cov_loss_fn=cov_loss_fn,
+        N=N,
+    )
+
+    # ========== Combine bidirectional losses ==========
+    total_loss = (loss_0_to_1 + loss_1_to_0) / 2.0
+
     metrics = {
-        'cov_nll_0_to_1': details.get('cov_nll_a_to_b', 0),
-        'cov_nll_1_to_0': details.get('cov_nll_b_to_a', 0),
-        'total_loss': details.get('cov_total', 0),
+        'total_loss': total_loss.item(),
+        'cov_nll_0_to_1': loss_0_to_1.item(),
+        'cov_nll_1_to_0': loss_1_to_0.item(),
+        "covariances_0": loss_0_to_1_metrics["covariances_src"],
+        "covariances_1": loss_1_to_0_metrics["covariances_src"],
+        "errors_0_to_1": loss_0_to_1_metrics["matched_errors"],
+        "errors_1_to_0": loss_1_to_0_metrics["matched_errors"],
+        "jacobian_0_to_1": loss_0_to_1_metrics["jacobian"],
+        "jacobian_1_to_0": loss_1_to_0_metrics["jacobian"],
     }
 
-    return loss, metrics
+    return total_loss, metrics
+
+
+def _extract_matched_keypoints_for_covariance(
+    mask: torch.Tensor,
+    covariances_src: torch.Tensor,
+    kpts_src_in_tgt: torch.Tensor,
+    covariances_tgt: torch.Tensor,
+    kpts_tgt: torch.Tensor,
+    nearest_idx: torch.Tensor,
+    jacobian_all: torch.Tensor,
+    cov_loss_fn,
+    N: int,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Extract matched keypoints and compute covariance loss for one direction.
+
+    This helper function avoids code duplication between the two bidirectional directions.
+
+    Args:
+        mask: (B, N) boolean mask indicating matched keypoints in source view
+        covariances_src: (B, N, 2, 2) covariances for source view
+        kpts_src_in_tgt: (B, N, 2) source keypoints projected to target view
+        covariances_tgt: (B, N, 2, 2) covariances for target view
+        kpts_tgt: (B, N, 2) keypoints in target view
+        nearest_idx: (B, N) nearest neighbor indices from source to target
+        jacobian_all: (B, N, 2, 2) Jacobians for all source keypoints
+        cov_loss_fn: CovarianceLoss instance
+        N: Number of keypoints
+
+    Returns:
+        loss: Scalar covariance loss for this direction
+        num_matches: Number of matched keypoints
+    """
+    device = covariances_src.device
+
+    # Extract ALL matched keypoints across batches using mask
+    matched_idx = mask.flatten().nonzero(as_tuple=True)[0]  # (TotalM,)
+
+    if len(matched_idx) > 0:
+        # Convert flat indices to (batch, keypoint) indices
+        batch_idx = matched_idx // N  # (TotalM,)
+
+        # Extract matched keypoints' data - NOW WITH FEWER POINTS!
+        matched_cov_src = covariances_src.reshape(-1, 2, 2)[matched_idx]  # (TotalM, 2, 2)
+
+        # Get nearest neighbors for matched keypoints
+        nearest_idx_matched = nearest_idx.reshape(-1)[matched_idx]  # (TotalM,)
+
+        # Project keypoint indices to flat indexing for target view
+        matched_nearest_kpts_tgt_flat_idx = batch_idx * N + nearest_idx_matched
+        matched_nearest_kpts_tgt = kpts_tgt.reshape(-1, 2)[matched_nearest_kpts_tgt_flat_idx]  # (TotalM, 2)
+
+        # Compute errors for matched keypoints only
+        matched_kpts_src_in_tgt = kpts_src_in_tgt.reshape(-1, 2)[matched_idx]  # (TotalM, 2)
+        matched_errors = matched_kpts_src_in_tgt - matched_nearest_kpts_tgt  # (TotalM, 2)
+
+        # Get matched covariances from target view
+        matched_cov_tgt = covariances_tgt.reshape(-1, 2, 2)[matched_nearest_kpts_tgt_flat_idx]  # (TotalM, 2, 2)
+
+        # Extract Jacobians ONLY for matched keypoints
+        matched_jacobian = jacobian_all.reshape(-1, 2, 2)[matched_idx]  # (TotalM, 2, 2)
+
+        # Compute loss for this direction
+        loss, loss_metrics = cov_loss_fn.forward_on_flattened(
+            matched_cov_src, matched_cov_tgt,
+            matched_errors, matched_jacobian
+        )
+        num_matches = len(matched_idx)
+    else:
+        loss = torch.tensor(0.0, device=device, requires_grad=True)
+        num_matches = 0
+
+    return loss, {
+        "num_matches": num_matches,
+        **loss_metrics,
+        "jacobian": matched_jacobian,
+        "covariances_src": matched_cov_src,
+        "covariances_tgt": matched_cov_tgt,
+        "matched_errors": matched_errors,
+    }
 
 
 __all__ = [

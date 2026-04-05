@@ -378,6 +378,121 @@ class CovarianceLoss(nn.Module):
 
         return loss
 
+    def forward_on_flattened(
+        self,
+        covariances_a: torch.Tensor,  # (TotalM, 2, 2)
+        covariances_b: torch.Tensor,  # (TotalM, 2, 2)
+        reprojection_errors: torch.Tensor,  # (TotalM, 2)
+        jacobian: torch.Tensor,  # (TotalM, 2, 2)
+    ) -> torch.Tensor:
+        """
+        Compute covariance NLL loss on flattened matched keypoints.
+
+        No batch dimension - all matched keypoints across all batches are flattened.
+        This is the optimized version that operates only on matched keypoints.
+
+        Args:
+            covariances_a: (TotalM, 2, 2) covariance matrices for source keypoints
+            covariances_b: (TotalM, 2, 2) covariance matrices for target keypoints
+            reprojection_errors: (TotalM, 2) error vectors
+            jacobian: (TotalM, 2, 2) Jacobian matrices for homography
+
+        Returns:
+            loss: Scalar loss (mean NLL over all matched keypoints)
+        """
+        TotalM = covariances_a.shape[0]
+        device = covariances_a.device
+
+        # Early exit if no matches
+        if TotalM == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # ========== Propagate covariance through homography ==========
+        # sigma_b_propagated = J @ cov_b @ J^T
+        sigma_b_propagated = torch.einsum(
+            'mij,mjk,mkl->mil',
+            jacobian, covariances_b, jacobian.transpose(-1, -2)
+        )
+
+        # Combined error covariance
+        sigma_error = covariances_a + sigma_b_propagated  # (TotalM, 2, 2)
+
+        # Add epsilon for numerical stability
+        eps_matrix = self.epsilon * torch.eye(2, device=device)
+        sigma_error = sigma_error + eps_matrix
+
+        # ========== Ensure positive definite ==========
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(sigma_error)
+            eigenvalues = torch.clamp(eigenvalues, min=self.epsilon)
+            sigma_error = torch.einsum(
+                '...ij,...j,...kj->...ik',
+                eigenvectors, eigenvalues, eigenvectors
+            )
+        except RuntimeError:
+            logger.warning("Eigendecomposition failed in forward_on_flattened")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Check for NaN/Inf
+        if not torch.isfinite(sigma_error).all():
+            logger.warning("NaN/Inf in sigma_error")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # ========== Cholesky decomposition for inverse ==========
+        try:
+            L = torch.linalg.cholesky(sigma_error)  # (TotalM, 2, 2)
+            sigma_inv = torch.cholesky_inverse(L)  # (TotalM, 2, 2)
+            log_det = 2 * torch.log(
+                torch.diagonal(L, dim1=-2, dim2=-1).clamp(min=self.epsilon)
+            ).sum(dim=-1)  # (TotalM,)
+        except RuntimeError:
+            # Fallback to pseudo-inverse
+            sigma_inv = torch.linalg.pinv(sigma_error)
+            det = torch.det(sigma_error)
+            log_det = torch.log(det.clamp(min=self.epsilon))
+
+        # Check for NaN/Inf
+        if not torch.isfinite(sigma_inv).all() or not torch.isfinite(log_det).all():
+            logger.warning("NaN/Inf in sigma_inv or log_det")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # ========== Mahalanobis distance ==========
+        mahalanobis = torch.einsum(
+            'mi,mij,mj->m',
+            reprojection_errors, sigma_inv, reprojection_errors
+        )  # (TotalM,)
+
+        if not torch.isfinite(mahalanobis).all():
+            logger.warning("NaN/Inf in mahalanobis")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # ========== Negative log-likelihood ==========
+        nll = 0.5 * (log_det + mahalanobis)  # (TotalM,)
+
+        # Debug: Check for negative values (this is mathematically possible but unusual)
+        # num_negative = (nll < 0).sum().item()
+        # if num_negative > 0 and num_negative > TotalM * 0.1:  # Only log if >10% are negative
+        #     logger.warning(
+        #         f"Negative NLL in {num_negative}/{TotalM} points ({num_negative/TotalM:.1%}). "
+        #         f"log_det: [{log_det.min():.2f}, {log_det.max():.2f}], "
+        #         f"mahalanobis: [{mahalanobis.min():.2f}, {mahalanobis.max():.2f}], "
+        #         f"This is mathematically valid (det<1) but indicates small covariances."
+        #     )
+
+        # Final check
+        if not torch.isfinite(nll).all():
+            logger.warning("NaN/Inf in nll")
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Average over all matched keypoints
+        loss = nll.mean()
+
+        return loss, {
+            "log_det": log_det,
+            "mahalanobis": mahalanobis,
+            "total_points": TotalM,
+        }
+
     def forward_bidirectional(
         self,
         covariances_a: torch.Tensor,

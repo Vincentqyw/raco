@@ -51,7 +51,8 @@ def log_ranker_metrics(
 def log_covariance_metrics(
     writer: SummaryWriter,
     iteration: int,
-    loss_metrics: Dict[str, float]
+    loss_metrics: Dict[str, float],
+    full: bool = False,
 ) -> None:
     """
     Log covariance-specific metrics to TensorBoard.
@@ -61,9 +62,73 @@ def log_covariance_metrics(
         iteration: Current training step
         loss_metrics: Dict with loss metrics from compute_covariance_loss
     """
+    # NLL loss metrics
     writer.add_scalar("covariance/nll_0_to_1", loss_metrics['cov_nll_0_to_1'], iteration)
     writer.add_scalar("covariance/nll_1_to_0", loss_metrics['cov_nll_1_to_0'], iteration)
+    writer.add_scalar("covariance/total_loss", loss_metrics.get('total_loss', 0), iteration)
 
+    if full:
+        # Covariance statistics for debugging large values
+        cov0 = loss_metrics["covariances_0"]  # (B, N, 2, 2)
+        cov1 = loss_metrics["covariances_1"]  # (B, N, 2, 2)
+
+        # Covariance element-wise statistics
+        writer.add_scalar("covariance/cov0_mean", cov0.mean().item(), iteration)
+        writer.add_scalar("covariance/cov0_std", cov0.std().item(), iteration)
+        writer.add_scalar("covariance/cov0_max", cov0.max().item(), iteration)
+        writer.add_scalar("covariance/cov0_min", cov0.min().item(), iteration)
+
+        writer.add_scalar("covariance/cov1_mean", cov1.mean().item(), iteration)
+        writer.add_scalar("covariance/cov1_std", cov1.std().item(), iteration)
+        writer.add_scalar("covariance/cov1_max", cov1.max().item(), iteration)
+        writer.add_scalar("covariance/cov1_min", cov1.min().item(), iteration)
+
+        # Trace (variance) statistics - average variance across keypoints
+        trace0 = torch.diagonal(cov0, dim1=-2, dim2=-1).sum(-1)  # (B, N)
+        trace1 = torch.diagonal(cov1, dim1=-2, dim2=-1).sum(-1)  # (B, N)
+        writer.add_scalar("covariance/trace0_mean", trace0.mean().item(), iteration)
+        writer.add_scalar("covariance/trace0_std", trace0.std().item(), iteration)
+        writer.add_scalar("covariance/trace0_max", trace0.max().item(), iteration)
+        writer.add_scalar("covariance/trace1_mean", trace1.mean().item(), iteration)
+        writer.add_scalar("covariance/trace1_std", trace1.std().item(), iteration)
+        writer.add_scalar("covariance/trace1_max", trace1.max().item(), iteration)
+
+        # Determinant statistics - measure of overall uncertainty volume
+        try:
+            det0 = torch.det(cov0)
+            det1 = torch.det(cov1)
+            writer.add_scalar("covariance/det0_mean", det0.mean().item(), iteration)
+            writer.add_scalar("covariance/det0_std", det0.std().item(), iteration)
+            writer.add_scalar("covariance/det1_mean", det1.mean().item(), iteration)
+            writer.add_scalar("covariance/det1_std", det1.std().item(), iteration)
+        except RuntimeError:
+            # Determinant computation might fail for non-positive-definite matrices
+            pass
+
+        # Eigenvalue statistics - analyze uncertainty structure
+        try:
+            eigenvalues0, _ = torch.linalg.eigh(cov0)  # (B, N, 2)
+            eigenvalues1, _ = torch.linalg.eigh(cov1)
+            writer.add_scalar("covariance/eigenvalues0_max", eigenvalues0.max().item(), iteration)
+            writer.add_scalar("covariance/eigenvalues1_max", eigenvalues1.max().item(), iteration)
+            # Anisotropy ratio (lambda_max / lambda_min)
+            anisotropy0 = eigenvalues0[..., 1] / (eigenvalues0[..., 0] + 1e-8)
+            anisotropy1 = eigenvalues1[..., 1] / (eigenvalues1[..., 0] + 1e-8)
+            writer.add_scalar("covariance/anisotropy0_mean", anisotropy0.mean().item(), iteration)
+            writer.add_scalar("covariance/anisotropy1_mean", anisotropy1.mean().item(), iteration)
+        except RuntimeError:
+            # Eigenvalue decomposition might fail for invalid matrices
+            pass
+
+        # Reprojection error statistics (for context)
+        errors_0_to_1 = loss_metrics.get("errors_0_to_1")
+        errors_1_to_0 = loss_metrics.get("errors_1_to_0")
+        if errors_0_to_1 is not None:
+            error_norm_0_to_1 = torch.norm(errors_0_to_1, dim=-1)  # (B, N)
+            writer.add_scalar("covariance/reproj_error_0_to_1", error_norm_0_to_1.mean().item(), iteration)
+        if errors_1_to_0 is not None:
+            error_norm_1_to_0 = torch.norm(errors_1_to_0, dim=-1)  # (B, N)
+            writer.add_scalar("covariance/reproj_error_1_to_0", error_norm_1_to_0.mean().item(), iteration)  
 
 def log_ranker_covariance_metrics(
     writer: SummaryWriter,

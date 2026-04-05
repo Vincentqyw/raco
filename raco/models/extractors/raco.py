@@ -215,6 +215,16 @@ class RaCo(BaseModel):
             self.covariance_estimator_head = nn.Sequential(*cov_modules)
             self.var_activation = nn.Softplus()
 
+            # Initialize the last layer to output reasonable covariance values
+            # Default init gives small values, so we initialize bias to give larger initial covariances
+            # This prevents negative NLL in early training
+            with torch.no_grad():
+                # Set bias to give initial log-variance around 0 -> variance around 1
+                # Output is [var_x, cov_xy, var_y]
+                # We want softplus(bias_x) ≈ 1.5, softplus(bias_y) ≈ 1.5
+                # softplus(x) ≈ x for x >> 0, so bias ≈ 1.5 for vars, 0 for cov
+                self.covariance_estimator_head[-1].bias.data[:] = torch.tensor([0.5, 0.0, 0.5])
+
         if self.conf.weights is not None:
             # Load pretrained weights from URL or local path
             if isinstance(self.conf.weights, str) and self.conf.weights.startswith(
@@ -357,7 +367,7 @@ class RaCo(BaseModel):
             cov_values = _sample_at_positions(
                 cov_feat, kpts, H, W, self.conf.subpixel_sampling
             )
-            result["covariances"] = _covariance_matrix_from_cholesky(cov_values)
+            result["covariances"] = _covariance_matrix_from_cholesky(cov_values)  # (B, N, 2, 2)
             if not self.training:
                 result["covariances_map"] = cov_feat  # B x 3 x H x W
 

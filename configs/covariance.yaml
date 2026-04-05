@@ -1,0 +1,74 @@
+# Default configuration for RaCo training
+
+# Dataset configuration
+dataset:
+  name: oxford_paris
+  data_root: /mnt/e/datasets/raco
+  datasets: [roxford5k, rparis6k]
+  image_size: [360, 360] #[640, 640]
+  train_size: 400000
+  val_size: 200
+  batch_size: 4
+  num_workers: 16
+  seed: 1
+  pin_memory: true          # Faster CPU->GPU transfer
+  persistent_workers: true  # Avoid worker recreation
+  homography:
+    difficulty: 0.7
+    translation: 1.0
+    max_angle: 45
+    n_angles: 10
+    min_convexity: 0.05
+    patch_shape: null  # null for same as image_size
+  photometric:
+    p: 0.5
+
+# Model configuration
+model:
+  name: raco
+  max_num_keypoints: 1024
+  nms_radius: 3
+  subpixel_sampling: true
+  subpixel_temp: 0.5
+  covariance_estimator: true
+  sort_by_ranker: false
+  weights: /root/projects/raco/outputs/20260405_144454/detector_step_9000.pth  # pretrained weights
+  detector:
+    d_max: 1.2
+    rho_pos: 1.0
+    rho_neg_max: 1.0e-2
+  ranker:
+    lambda_ranker: 1.0
+
+# Training configuration
+train:
+  stage: covariance  # detector, ranker, covariance, all
+  lr: 2.0e-4                # Reduced from 2e-4 for stability
+  weight_decay: 1.0e-6
+  detector_steps: 20000
+  ranker_epochs: 1
+  ranker_covariance_steps: 20000  # For joint training of ranker + covariance
+  covariance_steps: 20000
+  lambda_ranker_loss: 1.0      # Weight for ranker loss in joint training
+  lambda_covariance_loss: 0.1  # Weight for covariance loss in joint training
+  log_interval: 10             # More frequent logging for debugging
+  save_interval: 1000
+  eval_interval: 1000           # Less frequent eval for speed
+  eval_during_training: true   # Disable during initial debugging
+  eval_before_training: false  # Run evaluation before training when weights are loaded
+  use_amp: false               # Mixed precision training
+  compile: false               # torch.compile() (PyTorch 2.0+)
+
+# Output configuration
+output:
+  output_dir: ./outputs/
+
+# Evaluation configuration
+eval:
+  name: hpatches
+  data_root: /mnt/e/datasets/hpatches-sequences-release  # hpatches dataset
+  batch_size: 1
+  num_workers: 16
+  # Fast eval options (set to null for full evaluation)
+  max_scenes: 5        # Limit number of scenes (e.g., 10 for quick eval)
+  max_pairs_per_scene: 1  # Limit pairs per scene (e.g., 2 for quick eval)

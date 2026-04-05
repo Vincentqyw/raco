@@ -192,13 +192,15 @@ class StageTrainer:
             logger.warning(f"  kpts0 range: [{kpts0.min().item():.4f}, {kpts0.max().item():.4f}]")
             return None
 
-        # Compute mutual nearest neighbors
+        # Compute mutual nearest neighbors with bounds checking
         match_threshold = 3.0
         mutual_mask_0_to_1, nearest_idx_0_to_1, distances_0_to_1 = compute_mutual_dist(
-            kpts0_in_1, kpts1, threshold=match_threshold
+            kpts0_in_1, kpts1, threshold=match_threshold,
+            H0=H, W0=W, H1=H, W1=W
         )
         mutual_mask_1_to_0, nearest_idx_1_to_0, distances_1_to_0 = compute_mutual_dist(
-            kpts1_in_0, kpts0, threshold=match_threshold
+            kpts1_in_0, kpts0, threshold=match_threshold,
+            H0=H, W0=W, H1=H, W1=W
         )
 
         # Valid masks
@@ -213,7 +215,7 @@ class StageTrainer:
         return (
             mutual_mask_0_to_1, nearest_idx_0_to_1, distances_0_to_1,
             mutual_mask_1_to_0, nearest_idx_1_to_0, distances_1_to_0,
-            valid_0_to_1, valid_1_to_0, kpts0_in_1, kpts1_in_0, B, kpts0, kpts1, H_0to1
+            valid_0_to_1, valid_1_to_0, kpts0_in_1, kpts1_in_0, kpts0, kpts1, H_0to1
         )
 
     def train_step(
@@ -246,7 +248,7 @@ class StageTrainer:
             (
                 mutual_mask_0_to_1, nearest_idx_0_to_1, distances_0_to_1,
                 mutual_mask_1_to_0, nearest_idx_1_to_0, distances_1_to_0,
-                valid_0_to_1, valid_1_to_0, kpts0_in_1, kpts1_in_0, B, kpts0, kpts1, H_0to1
+                valid_0_to_1, valid_1_to_0, kpts0_in_1, kpts1_in_0, kpts0, kpts1, H_0to1
             ) = reprojection_data
 
             # Compute loss based on stage
@@ -263,7 +265,7 @@ class StageTrainer:
             elif self.stage == "ranker":
                 loss, loss_metrics = compute_ranker_loss(
                     pred, self.rank_loss_fn,
-                    mutual_mask_0_to_1, mutual_mask_1_to_0,
+                    valid_0_to_1, valid_1_to_0,
                     nearest_idx_0_to_1, nearest_idx_1_to_0
                 )
 
@@ -279,7 +281,7 @@ class StageTrainer:
                 # Joint training: compute both losses
                 ranker_loss, ranker_metrics = compute_ranker_loss(
                     pred, self.rank_loss_fn,
-                    mutual_mask_0_to_1, mutual_mask_1_to_0,
+                    valid_0_to_1, valid_1_to_0,
                     nearest_idx_0_to_1, nearest_idx_1_to_0
                 )
                 cov_loss, cov_metrics = compute_covariance_loss(
@@ -322,7 +324,7 @@ class StageTrainer:
         self.scheduler.step()
 
         # Return loss and metrics with extra data for logging
-        return loss, loss_metrics, pred, mutual_mask_0_to_1
+        return loss, loss_metrics, pred, mutual_mask_0_to_1, mutual_mask_1_to_0
 
     def train(
         self,
@@ -367,7 +369,7 @@ class StageTrainer:
                 if result is None:
                     continue
 
-                loss, loss_metrics, pred, mutual_mask_0_to_1 = result
+                loss, loss_metrics, pred, mutual_mask_0_to_1, mutual_mask_1_to_0  = result
 
                 # Logging
                 if iteration % self.log_interval == 0:
@@ -380,7 +382,7 @@ class StageTrainer:
                     elif self.stage == "ranker":
                         log_ranker_metrics(self.writer, iteration, loss_metrics)
                     elif self.stage == "covariance":
-                        log_covariance_metrics(self.writer, iteration, loss_metrics)
+                        log_covariance_metrics(self.writer, iteration, loss_metrics, True)
                     elif self.stage == "ranker_covariance":
                         log_ranker_covariance_metrics(self.writer, iteration, loss_metrics)
 
