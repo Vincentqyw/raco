@@ -417,7 +417,7 @@ class RaCo(BaseModel):
             )
         return feats
 
-    def _sample_keypoints(self, prob_map, raw_scores: Optional[torch.Tensor] = None):
+    def _sample_keypoints(self, prob_map, raw_scores: Optional[torch.Tensor] = None, sample_topk=True):
         """Sample keypoints from probability map with NMS."""
         # B = prob_map.shape[0]
         B, C, H, W = prob_map.size()
@@ -450,9 +450,12 @@ class RaCo(BaseModel):
 
         # Top-k: select topk keypoints from NMS-suppressed map
         prob_flat = prob_nms.reshape(B, H * W)
-        topk = torch.topk(prob_flat, k=num_kpts, dim=1)
 
-        hw_inds = topk.indices
+        if sample_topk:
+            hw_inds = torch.topk(prob_flat, k=num_kpts, dim=1).indices
+        else:
+            hw_inds = torch.multinomial(prob_flat, num_samples=num_kpts, replacement=False)
+
         h_inds = hw_inds // W
         w_inds = hw_inds % W
         kpts = torch.stack([w_inds.float(), h_inds.float()], dim=-1)   # (B, num_kpts, 2)
@@ -462,10 +465,7 @@ class RaCo(BaseModel):
             offsets = _compute_subpixel_offsets(raw_scores, hw_inds, nms_radius, self.conf.subpixel_temp)
             kpts = kpts + offsets
 
-        # Get scores at keypoints
-        scores = topk.values
-
-        return kpts + 0.5 #, {"detection_scores": scores}
+        return kpts + 0.5
 
     def loss(self, pred, data):
         """Compute losses - to be implemented with proper loss functions."""

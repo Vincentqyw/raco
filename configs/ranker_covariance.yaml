@@ -27,7 +27,7 @@ dataset:
 model:
   name: raco
   max_num_keypoints: 480
-  nms_radius: 3
+  nms_radius: 5
   subpixel_sampling: true
   subpixel_temp: 0.5
   covariance_estimator: true

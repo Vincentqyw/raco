@@ -27,12 +27,12 @@ dataset:
 model:
   name: raco
   max_num_keypoints: 480
-  nms_radius: 3
+  nms_radius: 5
   subpixel_sampling: true
   subpixel_temp: 0.5
   covariance_estimator: true
   sort_by_ranker: false
-  weights: /root/projects/raco/outputs/20260405_144454/detector_step_9000.pth  # pretrained weights
+  weights: /root/projects/raco/outputs/20260406_022850/covariance_final.pth  # pretrained weights
   detector:
     d_max: 1.2
     rho_pos: 1.0
@@ -46,14 +46,14 @@ train:
   lr: 2.0e-4                # Reduced from 2e-4 for stability
   weight_decay: 1.0e-6
   detector_steps: 20000
-  ranker_epochs: 1
+  ranker_epochs: 10
   ranker_covariance_steps: 20000  # For joint training of ranker + covariance
   covariance_steps: 20000
   lambda_ranker_loss: 1.0      # Weight for ranker loss in joint training
   lambda_covariance_loss: 0.1  # Weight for covariance loss in joint training
   log_interval: 10            # More frequent logging for debugging
-  save_interval: 100
-  eval_interval: 10 0         # Less frequent eval for speed
+  save_interval: 500
+  eval_interval: 500         # Less frequent eval for speed
   eval_during_training: true  # Disable during initial debugging
   eval_before_training: false  # Run evaluation before training when weights are loaded
   use_amp: false              # Mixed precision training

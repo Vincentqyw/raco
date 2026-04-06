@@ -237,20 +237,22 @@ class RankingLoss(nn.Module):
         # Compute soft ranks
         soft_ranks_a = self.soft_rank(
             ranker_scores_a,
-            direction="ASCENDING",
+            direction="DESCENDING",
             regularization_strength=self.regularization_strength
         )
         soft_ranks_b = self.soft_rank(
             ranker_scores_b,
-            direction="ASCENDING",
+            direction="DESCENDING",
             regularization_strength=self.regularization_strength
         )
 
         # Normalize ranks to [0, 1] for numerical stability
-        soft_ranks_a_norm = (soft_ranks_a - 1) / (N - 1 + 1e-8)  # (B, N)
-        soft_ranks_b_norm = (soft_ranks_b - 1) / (N - 1 + 1e-8)  # (B, N)
+        # DESCENDING mode returns values in [-N, -1] where -1 is highest rank (best)
+        # Convert to [0, 1] where -1 → 0 (best) and -N → 1 (worst)
+        soft_ranks_a_norm = (-soft_ranks_a - 1) / (N - 1 + 1e-8)  # (B, N)
+        soft_ranks_b_norm = (-soft_ranks_b - 1) / (N - 1 + 1e-8)  # (B, N)
 
-        # ========== Spearman Loss (Eq. 4) ==========
+        # Spearman Loss (Eq. 4)
         # Get ranks of matched keypoints using boolean indexing
         matched_ranks_a = soft_ranks_a_norm[mutual_mask_a]  # (M,) where M = total matches across batch
 
@@ -265,7 +267,7 @@ class RankingLoss(nn.Module):
         else:
             spearman_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ========== Pull Loss (Eq. 5) ==========
+        # Pull Loss (Eq. 5)
         # Target: matched keypoints → rank 1 (target 0 after normalization)
         #         unmatched keypoints → rank N (target 1 after normalization)
         target_a = torch.where(
@@ -274,10 +276,8 @@ class RankingLoss(nn.Module):
             torch.ones_like(soft_ranks_a_norm)     # unmatched: pull to rank N → target 1
         )
 
-        # L1 loss averaged over all keypoints
         pull_loss = F.l1_loss(soft_ranks_a_norm, target_a)
 
-        # ========== Total Loss ==========
         total_loss = spearman_loss + self.lambda_ranker * pull_loss
 
         return total_loss, {
@@ -407,7 +407,7 @@ class CovarianceLoss(nn.Module):
         if TotalM == 0:
             return torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ========== Propagate covariance through homography ==========
+        # Propagate covariance through homography
         # sigma_b_propagated = J @ cov_b @ J^T
         sigma_b_propagated = torch.einsum(
             'mij,mjk,mkl->mil',
@@ -421,7 +421,7 @@ class CovarianceLoss(nn.Module):
         eps_matrix = self.epsilon * torch.eye(2, device=device)
         sigma_error = sigma_error + eps_matrix
 
-        # ========== Ensure positive definite ==========
+        # Ensure positive definite
         try:
             eigenvalues, eigenvectors = torch.linalg.eigh(sigma_error)
             eigenvalues = torch.clamp(eigenvalues, min=self.epsilon)
@@ -438,7 +438,7 @@ class CovarianceLoss(nn.Module):
             logger.warning("NaN/Inf in sigma_error")
             return torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ========== Cholesky decomposition for inverse ==========
+        # Cholesky decomposition for inverse
         try:
             L = torch.linalg.cholesky(sigma_error)  # (TotalM, 2, 2)
             sigma_inv = torch.cholesky_inverse(L)  # (TotalM, 2, 2)
@@ -456,7 +456,7 @@ class CovarianceLoss(nn.Module):
             logger.warning("NaN/Inf in sigma_inv or log_det")
             return torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ========== Mahalanobis distance ==========
+        # Mahalanobis distance
         mahalanobis = torch.einsum(
             'mi,mij,mj->m',
             reprojection_errors, sigma_inv, reprojection_errors
@@ -466,7 +466,7 @@ class CovarianceLoss(nn.Module):
             logger.warning("NaN/Inf in mahalanobis")
             return torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ========== Negative log-likelihood ==========
+        # Negative log-likelihood
         nll = 0.5 * (log_det + mahalanobis)  # (TotalM,)
 
         # Debug: Check for negative values (this is mathematically possible but unusual)

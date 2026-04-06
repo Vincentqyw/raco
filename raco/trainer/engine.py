@@ -265,7 +265,8 @@ class StageTrainer:
             elif self.stage == "ranker":
                 loss, loss_metrics = compute_ranker_loss(
                     pred, self.rank_loss_fn,
-                    valid_0_to_1, valid_1_to_0,
+                    # valid_0_to_1, valid_1_to_0,
+                    mutual_mask_0_to_1, mutual_mask_1_to_0,
                     nearest_idx_0_to_1, nearest_idx_1_to_0
                 )
 
@@ -281,7 +282,8 @@ class StageTrainer:
                 # Joint training: compute both losses
                 ranker_loss, ranker_metrics = compute_ranker_loss(
                     pred, self.rank_loss_fn,
-                    valid_0_to_1, valid_1_to_0,
+                    # valid_0_to_1, valid_1_to_0,
+                    mutual_mask_0_to_1, mutual_mask_1_to_0,
                     nearest_idx_0_to_1, nearest_idx_1_to_0
                 )
                 cov_loss, cov_metrics = compute_covariance_loss(

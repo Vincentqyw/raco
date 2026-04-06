@@ -105,22 +105,31 @@ def create_covariance_figures(
     cov_map: torch.Tensor,
     title_prefix: str = "Covariance",
     cmaps: List[str] = ["viridis", "RdBu_r", "plasma"],
+    separate_channels: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
-    Create visualization for covariance as ellipse visualization.
+    Create comprehensive covariance visualizations.
 
-    Color represents the major axis angle of covariance ellipse.
-    Intensity is weighted by |Σ| (determinant), with higher uncertainty appearing whiter.
+    Provides multiple visualization options:
+    - Combined HSV: Angle (hue) + Uncertainty (whiter = more uncertain)
+    - Separate Cholesky factors (L11, L21, L22)
+    - Determinant map (uncertainty landscape)
+    - Anisotropy map (ellipse elongation)
+
+    Paper description: "colored by the angle of the covariance's first eigenvector"
+                      "illustrated by opacity" (larger covariance = more transparent/whiter)
 
     Args:
-        cov_map: Tensor of shape [H, W, 3] containing (L11, L21, L22) Cholesky factors
+        cov_map: Tensor of shape [H, W, 3] or [3, H, W] containing (L11, L21, L22) Cholesky factors
         title_prefix: Prefix for figure titles
-        cmaps: List of colormaps (not used, kept for compatibility)
+        cmaps: Colormaps for separate channels [L11, L21, L22]
+        separate_channels: If True, create individual channel visualizations
 
     Returns:
-        Dictionary mapping channel names to figure tensors
+        Dictionary mapping visualization names to figure tensors
     """
     from mpl_toolkits.axes_grid1 import make_axes_locatable
+    from matplotlib.colors import hsv_to_rgb
 
     if isinstance(cov_map, torch.Tensor):
         cov_map = cov_map.cpu().numpy()
@@ -132,23 +141,20 @@ def create_covariance_figures(
     H, W, C = cov_map.shape
     assert C == 3, f"Expected 3 channels, got {C}"
 
-    # Extract Cholesky factors
+    # === Extract Cholesky factors ===
     L11 = cov_map[..., 0]  # sqrt(var_x)
     L21 = cov_map[..., 1]  # cov_xy / sqrt(var_x)
     L22 = cov_map[..., 2]  # sqrt(var_y)
 
-    # Reconstruct covariance matrices: Σ = L @ L.T
-    # L = [[L11,  0 ],
-    #      [L21, L22]]
-    # Σ = [[L11^2,        L11*L21],
-    #      [L11*L21, L21^2+L22^2]]
+    # === Reconstruct covariance matrices: Σ = L @ L.T ===
+    # L = [[L11,  0 ],     Σ = [[L11^2,        L11*L21],
+    #      [L21, L22]]          [L11*L21, L21^2+L22^2]]
 
     Sigma_00 = L11 ** 2
     Sigma_01 = L11 * L21
     Sigma_11 = L21 ** 2 + L22 ** 2
 
-    # Compute eigenvalues for each pixel
-    # λ = (trace ± sqrt(trace^2 - 4*det)) / 2
+    # === Compute eigenvalues and derived quantities ===
     trace = Sigma_00 + Sigma_11
     det = Sigma_00 * Sigma_11 - Sigma_01 ** 2
 
@@ -160,56 +166,44 @@ def create_covariance_figures(
     lambda_1 = (trace + sqrt_disc) / 2  # Major eigenvalue
     lambda_2 = (trace - sqrt_disc) / 2  # Minor eigenvalue
 
+    # Anisotropy ratio: measures ellipse elongation (λ1/λ2)
+    # Higher = more elongated (anisotropic)
+    anisotropy = lambda_1 / (lambda_2 + 1e-8)
+
     # Major axis angle: θ = 0.5 * atan2(2*σ_01, σ_00 - σ_11)
-    # Range: [-π/2, π/2]
     angle = 0.5 * np.arctan2(2 * Sigma_01, Sigma_00 - Sigma_11)
+    angle_normalized = (angle + np.pi / 2) / np.pi  # [-π/2, π/2] -> [0, 1]
 
-    # Normalize angle to [0, 1] for colormap
-    # Angle range [-π/2, π/2] -> [0, 1]
-    angle_normalized = (angle + np.pi / 2) / np.pi
+    # === Create visualizations ===
+    results = {}
 
-    # Weight by determinant |Σ|: higher uncertainty = whiter
-    # Normalize determinant to [0, 1]
+    # Visualization 1: Combined HSV (angle=hue, det=value)
+    # Higher uncertainty -> whiter (lower value)
     det_normalized = det / (det.max() + 1e-8)
 
-    # Create HSV image: Hue from angle, Value weighted by det
-    # Higher det (more uncertainty) -> lower value (whiter in final image)
-    # Use HSV colormap for angles
-    from matplotlib.colors import hsv_to_rgb
-
-    # Hue: angle (0-1)
     hue = angle_normalized
-
-    # Saturation: always full
     saturation = np.ones_like(hue)
+    value = 1.0 - det_normalized * 0.7  # Whiter = more uncertain
 
-    # Value: inverse of uncertainty (high det -> low value -> whiter)
-    value = 1.0 - det_normalized * 0.7  # Scale to keep some visibility
-
-    # Stack to HSV
     hsv = np.stack([hue, saturation, value], axis=-1)
     rgb = hsv_to_rgb(hsv)
 
-    # Create figure with consistent size
     fig, ax = plt.subplots(figsize=(8, 6))
-
     im = ax.imshow(rgb, aspect="auto")
-    ax.set_title(f"{title_prefix}\nColor: Major axis angle | Brightness: |Σ| (whiter=higher uncertainty)",
-                 fontsize=10)
+    ax.set_title(
+        f"{title_prefix} - Combined\n"
+        f"Color: Major axis angle | Whiter: Higher uncertainty",
+        fontsize=10
+    )
     ax.axis("off")
 
-    # Use make_axes_locatable for consistent colorbar width (5%)
+    # Colorbar showing angle reference
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="5%", pad="3%")
 
-    # Create angle reference gradient
     angle_gradient = np.linspace(0, 1, 256).reshape(-1, 1)
     angle_gradient = np.repeat(angle_gradient, 20, axis=1)
-
-    hue_ref = angle_gradient
-    sat_ref = np.ones_like(angle_gradient)
-    val_ref = np.ones_like(angle_gradient)
-    hsv_ref = np.stack([hue_ref, sat_ref, val_ref], axis=-1)
+    hsv_ref = np.stack([angle_gradient, np.ones_like(angle_gradient), np.ones_like(angle_gradient)], axis=-1)
     rgb_ref = hsv_to_rgb(hsv_ref)
 
     cax.imshow(rgb_ref, aspect="auto", origin="lower", extent=[0, 1, -90, 90])
@@ -220,9 +214,41 @@ def create_covariance_figures(
     cax.tick_params(labelsize=8)
 
     fig.tight_layout()
+    # results["combined"] = figure_to_tensor(fig)
 
-    tensor = figure_to_tensor(fig)
-    results = {"combined": tensor}
+    # Visualization 2: Separate Cholesky factor channels
+    if separate_channels:
+        # L11 = sqrt(Var_x)
+        results["L11_sqrt_var_x"] = create_heatmap_figname(
+            L11, f"{title_prefix} - L11 = √(Var_x)",
+            cmap=cmaps[0], colorbar_label="√(Var_x)"
+        )
+
+        # L21 = Cov_xy / sqrt(Var_x)
+        results["L21_cov_xy_term"] = create_heatmap_figname(
+            L21, f"{title_prefix} - L21 = Cov_xy / √(Var_x)",
+            cmap=cmaps[1], colorbar_label="Cov_xy / √(Var_x)"
+        )
+
+        # L22 = sqrt(Var_y)
+        results["L22_sqrt_var_y"] = create_heatmap_figname(
+            L22, f"{title_prefix} - L22 = √(Var_y)",
+            cmap=cmaps[2], colorbar_label="√(Var_y)"
+        )
+
+    # Visualization 3: Determinant map (uncertainty landscape)
+    # results["determinant"] = create_heatmap_figname(
+    #     det, f"{title_prefix} - Determinant |Σ| (Uncertainty)",
+    #     cmap="plasma", colorbar_label="|Σ|"
+    # )
+
+    # Visualization 4: Anisotropy map (ellipse elongation)
+    # Clip to reasonable range for visualization
+    # anisotropy_clipped = np.clip(anisotropy, 1, 10)
+    # results["anisotropy"] = create_heatmap_figname(
+    #     anisotropy_clipped, f"{title_prefix} - Anisotropy λ₁/λ₂",
+    #     cmap="magma", colorbar_label="λ₁/λ₂ (clipped to [1, 10])"
+    # )
 
     return results
 
@@ -471,10 +497,19 @@ class EnhancedTensorBoardLogger:
         if "covariances_map" in pred.get("image0", {}):
             covariances_map = pred["image0"]["covariances_map"][0].cpu().numpy()  # [3, H, W]
             covariances_map = covariances_map.transpose(1, 2, 0)  # [H, W, 3]
-            cov_figs = create_covariance_figures(covariances_map,title_prefix=f"{seq_name}")
-            self.writer.add_image(
-                f"{tag_prefix}/covariance_maps", cov_figs["combined"], global_step
+            cov_figs = create_covariance_figures(
+                covariances_map,
+                title_prefix=f"{seq_name}",
+                separate_channels=True  # Enable all visualizations
             )
+
+            # Log all visualizations to TensorBoard
+            for viz_name, viz_tensor in cov_figs.items():
+                self.writer.add_image(
+                    f"{tag_prefix}/covariance_{viz_name}",
+                    viz_tensor,
+                    global_step
+                )
 
         # 4. Log keypoints overlay
         keypoints = pred["keypoints_0"][0]  # [N, 2]

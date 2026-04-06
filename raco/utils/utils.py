@@ -12,6 +12,27 @@ import numpy as np
 import torch
 
 
+def get_best_device(verbose=False):
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    if verbose:
+        print(f"Fastest device found is: {device}")
+    return device
+
+
+def get_grid(B, H, W, device=get_best_device()):
+    x1_n = torch.meshgrid(
+        *[torch.linspace(-1 + 1 / n, 1 - 1 / n, n, device=device) for n in (B, H, W)],
+        indexing="ij",
+    )
+    x1_n = torch.stack((x1_n[2], x1_n[1]), dim=-1).reshape(B, H * W, 2)
+    return x1_n
+
 class ImagePreprocessor:
     default_conf = {
         "resize": None,  # target edge length, None for no resizing

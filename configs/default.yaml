@@ -27,7 +27,7 @@ dataset:
 model:
   name: raco
   max_num_keypoints: 480
-  nms_radius: 3
+  nms_radius: 5
   subpixel_sampling: true
   subpixel_temp: 0.5
   covariance_estimator: true
@@ -42,7 +42,7 @@ model:
 
 # Training configuration
 train:
-  stage: all  # detector, ranker, covariance, ranker_covariance, all
+  stage: detector  # detector, ranker, covariance, ranker_covariance, all
   lr: 2.0e-4                # Reduced from 2e-4 for stability
   weight_decay: 1.0e-6
   detector_steps: 20000
