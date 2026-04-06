@@ -5,7 +5,7 @@ Extracted from train.py for better modularity.
 
 import torch
 from loguru import logger
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Callable
 
 from raco.geometry.homography import compute_homography_jacobian
 
@@ -228,7 +228,7 @@ def _extract_matched_keypoints_for_covariance(
     kpts_tgt: torch.Tensor,
     nearest_idx: torch.Tensor,
     jacobian_all: torch.Tensor,
-    cov_loss_fn,
+    cov_loss_fn: Callable,
     N: int,
 ) -> Tuple[torch.Tensor, int]:
     """
@@ -281,23 +281,25 @@ def _extract_matched_keypoints_for_covariance(
         matched_jacobian = jacobian_all.reshape(-1, 2, 2)[matched_idx]  # (TotalM, 2, 2)
 
         # Compute loss for this direction
-        loss, loss_metrics = cov_loss_fn.forward_on_flattened(
+        loss, loss_metrics = cov_loss_fn(
             matched_cov_src, matched_cov_tgt,
             matched_errors, matched_jacobian
         )
         num_matches = len(matched_idx)
+        return loss, {
+            "num_matches": num_matches,
+            **loss_metrics,
+            "jacobian": matched_jacobian,
+            "covariances_src": matched_cov_src,
+            "covariances_tgt": matched_cov_tgt,
+            "matched_errors": matched_errors,
+        }
     else:
         loss = torch.tensor(0.0, device=device, requires_grad=True)
         num_matches = 0
-
-    return loss, {
-        "num_matches": num_matches,
-        **loss_metrics,
-        "jacobian": matched_jacobian,
-        "covariances_src": matched_cov_src,
-        "covariances_tgt": matched_cov_tgt,
-        "matched_errors": matched_errors,
-    }
+        return loss, {
+            "num_matches": num_matches,
+        }
 
 
 __all__ = [
