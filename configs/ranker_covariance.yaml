@@ -30,13 +30,13 @@ model:
   nms_radius: 5
   subpixel_sampling: true
   subpixel_temp: 0.5
-  covariance_estimator: true
   sort_by_ranker: false
   weights: /root/projects/raco/outputs/20260405_144454/detector_step_9000.pth  # pretrained weights
   detector:
     d_max: 1.2
     rho_pos: 1.0
     rho_neg_max: 1.0e-2
+  covariance_estimator: true
   ranker:
     lambda_ranker: 1.0
 

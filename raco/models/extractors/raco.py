@@ -215,37 +215,6 @@ class RaCo(BaseModel):
             self.covariance_estimator_head = nn.Sequential(*cov_modules)
             self.var_activation = nn.Softplus()
 
-            # Initialize the last layer to output reasonable covariance values
-            # Default init gives small values, so we initialize bias to give larger initial covariances
-            # This prevents negative NLL in early training
-            with torch.no_grad():
-                # Set bias to give initial log-variance around 0 -> variance around 1
-                # Output is [var_x, cov_xy, var_y]
-                # We want softplus(bias_x) ≈ 1.5, softplus(bias_y) ≈ 1.5
-                # softplus(x) ≈ x for x >> 0, so bias ≈ 1.5 for vars, 0 for cov
-                self.covariance_estimator_head[-1].bias.data[:] = torch.tensor([0.5, 0.0, 0.5])
-
-        if self.conf.weights is not None:
-            # Load pretrained weights from URL or local path
-            if isinstance(self.conf.weights, str) and self.conf.weights.startswith(
-                ("http://", "https://")
-            ):
-                state_dict = torch.hub.load_state_dict_from_url(
-                    self.conf.weights,
-                    map_location="cpu",
-                    progress=True,
-                    weights_only=True,
-                )
-            else:
-                state_dict = torch.load(
-                    self.conf.weights, map_location="cpu", weights_only=True
-                )
-
-            self.load_state_dict(state_dict, strict=False)
-            logger.info(f"[RaCo] Loaded weights from {self.conf.weights}")
-        else:
-            logger.warning(f"[RaCo] weight is None")
-
 
     def forward_dual(self, data):
         """Forward pass returning predictions."""
