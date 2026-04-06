@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **This is an UNOFFICIAL reproduction of the RaCo training code.**
+> 
+> This repository contains a reproduction of the training code for [**RaCo: Ranking and Covariance for Practical Learned Keypoints**](https://arxiv.org/abs/2602.15755) (3DV 2026). It is not affiliated with the original authors or their official implementation.
+> 
+> For the official implementation, please refer to [Glue Factory](https://github.com/cvg/glue-factory).
+
 <p align="center">
   <h1 align="center">RaCo: Ranking and Covariance<br>for Practical Learned Keypoints</h1>
   <p align="center">
