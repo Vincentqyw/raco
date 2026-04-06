@@ -216,6 +216,28 @@ class RaCo(BaseModel):
             self.var_activation = nn.Softplus()
 
 
+        if self.conf.weights is not None:
+            # Load pretrained weights from URL or local path
+            if isinstance(self.conf.weights, str) and self.conf.weights.startswith(
+                ("http://", "https://")
+            ):
+                state_dict = torch.hub.load_state_dict_from_url(
+                    self.conf.weights,
+                    map_location="cpu",
+                    progress=True,
+                    weights_only=True,
+                )
+            else:
+                state_dict = torch.load(
+                    self.conf.weights, map_location="cpu", weights_only=True
+                )
+
+            self.load_state_dict(state_dict, strict=False)
+            logger.info(f"[RaCo] Loaded weights from {self.conf.weights}")
+        else:
+            logger.warning(f"[RaCo] weight is None")
+
+
     def forward_dual(self, data):
         """Forward pass returning predictions."""
         pred = {}

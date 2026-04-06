@@ -16,7 +16,7 @@ from raco.geometry.matching import get_valid_mask, compute_mutual_dist
 from raco.trainer.mixed_precision import setup_amp, autocast, GradScaler
 from raco.trainer.checkpoint import save_checkpoint
 from raco.trainer.model_utils import set_stage_require_grad
-from raco.trainer.losses import compute_detector_loss, compute_ranker_loss, compute_covariance_loss
+from raco.models.losses.compute_losses import compute_detector_loss, compute_ranker_loss, compute_covariance_loss
 from raco.trainer.metrics import (
     log_detector_metrics, log_ranker_metrics, log_covariance_metrics,
     log_ranker_covariance_metrics, log_gradients, build_postfix

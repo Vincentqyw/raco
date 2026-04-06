@@ -31,7 +31,7 @@ model:
   subpixel_sampling: true
   subpixel_temp: 0.5
   sort_by_ranker: false
-  weights: /root/projects/raco/outputs/20260405_144454/detector_step_9000.pth  # pretrained weights
+  weights: /root/projects/raco/outputs/pretrained/detector_step_9000.pth  # pretrained weights
   detector:
     d_max: 1.2
     rho_pos: 1.0

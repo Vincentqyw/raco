@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from loguru import logger
 from typing import Tuple, Dict, Optional
 from .soft_rank import soft_rank
+from ..reward_functions import ConstantReward
 
 
 class DetectorLoss(nn.Module):
@@ -18,46 +19,37 @@ class DetectorLoss(nn.Module):
 
     def __init__(
         self,
+        reward_fn: Optional[nn.Module] = None,
         d_max: float = 1.2,
         rho_pos: float = 1.0,
         rho_neg_max: float = 1e-2,
         epsilon: float = 1e-8,
     ):
         super().__init__()
-        self.d_max = d_max
-        self.rho_pos = rho_pos
-        self.rho_neg_max = rho_neg_max
-        self.epsilon = epsilon
-        self.step = 0
-
-    def compute_reward(self, reprojection_errors: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Compute reward based on reprojection error."""
-        # Dynamic negative reward: increases magnitude over training steps
-        rho_neg = -min(self.rho_neg_max, max(1e-6, self.step * 1e-7))
-
-        rewards = torch.where(
-            reprojection_errors <= self.d_max,
-            torch.full_like(reprojection_errors, self.rho_pos),
-            torch.full_like(reprojection_errors, rho_neg)
+        self.reward_fn = reward_fn or ConstantReward(
+            d_max=d_max, rho_pos=rho_pos, rho_neg_max=rho_neg_max, epsilon=epsilon
         )
+        self.epsilon = epsilon
 
-        # Apply mask: out-of-bounds pixels get 0 reward (no gradient)
-        if valid_mask is not None:
-            rewards = rewards * valid_mask.float()
+    def compute_reward(self, distances: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute reward using the configured reward function."""
+        return self.reward_fn(distances, valid_mask)
 
-        return rewards
-
-    def normalize_reward(self, rewards: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def normalize_reward(self, rewards: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, bool]:
         """
         Normalize reward following DaD paper:
         rho' = rho / (E[rho] + epsilon)
+
+        Also handles early exit when no valid keypoints exist.
 
         Args:
             rewards: (B, N) tensor of rewards
             valid_mask: (B, N) boolean tensor indicating valid keypoints
 
         Returns:
-            normalized_rewards: (B, N) tensor
+            (normalized_rewards, should_exit) tuple:
+                - normalized_rewards: (B, N) tensor
+                - should_exit: bool indicating if no valid keypoints (loss should be zero)
         """
         if valid_mask is not None:
             # Compute mean over valid keypoints only
@@ -65,22 +57,30 @@ class DetectorLoss(nn.Module):
             reward_sum = valid_rewards.sum(dim=1, keepdim=True)
             valid_count = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
             reward_mean = reward_sum / valid_count
+
+            # Check if any valid keypoints exist
+            if valid_count.sum().item() == 0:
+                return rewards, True
+
         else:
             reward_mean = rewards.mean(dim=1, keepdim=True)
 
         # Add epsilon for numerical stability
         normalized_rewards = rewards / (reward_mean + self.epsilon)
-        return normalized_rewards
+        return normalized_rewards, False
 
     def forward(
         self,
         prob_map_flat: torch.Tensor,
-        reprojection_errors: torch.Tensor,
+        distances: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute detector loss."""
-        rewards = self.compute_reward(reprojection_errors, valid_mask)
-        normalized_rewards = self.normalize_reward(rewards, valid_mask)
+        rewards = self.compute_reward(distances, valid_mask)
+        normalized_rewards, should_exit = self.normalize_reward(rewards, valid_mask)
+
+        if should_exit:
+            return torch.tensor(0.0, device=prob_map_flat.device, requires_grad=True)
 
         # Clamp prob_map to avoid log(0)
         prob_map_clamped = prob_map_flat.clamp(min=self.epsilon, max=1.0)
@@ -111,55 +111,18 @@ class DetectorLoss(nn.Module):
             reprojection_errors: (B, N, 2, 1) or (B, N, 2) reprojection errors (dx, dy) for each keypoint
             valid_mask: (B, N) boolean mask for valid keypoints
         """
-        # Compute Euclidean distance from reprojection errors
-        # Supports multiple input formats:
-        # - (B, N): already computed distances
-        # - (B, N, 2): 2D error vectors
-        # - (B, N, 2, 1): 2D error vectors with extra dim
-        if reprojection_errors.dim() == 1:
-            # Already 1D distances (B * N flattened or single batch)
-            distances = reprojection_errors
-        elif reprojection_errors.dim() == 2:
-            # Already 2D (B, N) - distances already computed
-            distances = reprojection_errors
-        elif reprojection_errors.dim() == 4:
-            reprojection_errors = reprojection_errors.squeeze(-1)  # (B, N, 2)
-            distances = torch.norm(reprojection_errors, dim=-1)  # (B, N)
-        elif reprojection_errors.dim() == 3:
-            # (B, N, 2) error vectors
-            distances = torch.norm(reprojection_errors, dim=-1)  # (B, N)
-        else:
-            raise ValueError(f"Unexpected reprojection_errors dim: {reprojection_errors.dim()}")
+        # Compute Euclidean distance from reprojection errors, distances shape: (B, N)
+        assert reprojection_errors.dim() == 2, f"Unexpected reprojection_errors dim: {reprojection_errors.dim()}"
+        distances = reprojection_errors
+        rewards = self.compute_reward(distances, valid_mask)
 
-        # Use dynamic negative reward (as in compute_reward method)
-        rho_neg = -min(self.rho_neg_max, max(1e-6, self.step * 1e-7))
-        rewards = torch.where(
-            distances <= self.d_max,
-            torch.full_like(distances, self.rho_pos),      # positive reward for inliers
-            torch.full_like(distances, rho_neg)            # negative reward for outliers
-        )
-
-        # Apply valid mask
-        if valid_mask is not None:
-            rewards = rewards * valid_mask.float()
-
-        # Early exit: if no valid keypoints, return zero loss with requires_grad
-        if valid_mask is not None:
-            valid_count = valid_mask.float().sum().item()
-            if valid_count == 0:
-                return torch.tensor(0.0, device=prob_sparse.device, requires_grad=True), {
-                    "rewards": rewards,
-                    "distances": distances,
-                }
-
-        # Normalize rewards (per sample)
-        if valid_mask is not None:
-            valid_count = valid_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-            reward_mean = (rewards * valid_mask.float()).sum(dim=1, keepdim=True) / valid_count
-        else:
-            reward_mean = rewards.mean(dim=1, keepdim=True)
-
-        normalized_rewards = rewards / (reward_mean + self.epsilon)
+        normalized_rewards, should_exit = self.normalize_reward(rewards, valid_mask)
+        if should_exit:
+            logger.warning("No valid keypoints, return zero loss")
+            return torch.tensor(0.0, device=prob_sparse.device, requires_grad=True), {
+                "rewards": rewards,
+                "distances": distances,
+            }
 
         # Compute policy gradient loss
         log_probs = torch.log(prob_sparse.clamp(min=self.epsilon))
@@ -178,7 +141,8 @@ class DetectorLoss(nn.Module):
 
     def set_step(self, step: int):
         """Update training step for dynamic rho_neg."""
-        self.step = step
+        if isinstance(self.reward_fn, ConstantReward):
+            self.reward_fn.set_step(step)
 
 
 class RankingLoss(nn.Module):

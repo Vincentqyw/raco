@@ -31,7 +31,7 @@ model:
   subpixel_sampling: true
   subpixel_temp: 0.5
   sort_by_ranker: false
-  weights: null #/root/.cache/torch/hub/checkpoints/raco.pth  # pretrained weights, /root/.cache/torch/hub/checkpoints/raco.pth
+  weights: null #/root/.cache/torch/hub/checkpoints/raco.pth
   detector:
     d_max: 1.2
     rho_pos: 1.0
