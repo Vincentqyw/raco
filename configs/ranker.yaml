@@ -26,7 +26,7 @@ dataset:
 # Model configuration
 model:
   name: raco
-  max_num_keypoints: 1024
+  max_num_keypoints: 512
   nms_radius: 5
   subpixel_sampling: true
   subpixel_temp: 0.5
@@ -52,10 +52,10 @@ train:
   lambda_ranker_loss: 1.0      # Weight for ranker loss in joint training
   lambda_covariance_loss: 0.1  # Weight for covariance loss in joint training
   log_interval: 10            # More frequent logging for debugging
-  save_interval: 10
-  eval_interval: 10         # Less frequent eval for speed
-  eval_during_training: true  # Disable during initial debugging
-  eval_before_training: true  # Run evaluation before training when weights are loaded
+  save_interval: 1000
+  eval_interval: 1000         # Less frequent eval for speed
+  eval_during_training: false  # Disable during initial debugging
+  eval_before_training: false  # Run evaluation before training when weights are loaded
   use_amp: false              # Mixed precision training
   compile: false              # torch.compile() (PyTorch 2.0+)
 

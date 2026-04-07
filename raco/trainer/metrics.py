@@ -156,37 +156,49 @@ def log_ranker_covariance_metrics(
     if 'weighted_cov' in loss_metrics:
         writer.add_scalar("ranker_covariance/weighted_cov", loss_metrics['weighted_cov'], iteration)
 
-
 def log_gradients(
     writer: SummaryWriter,
     model: torch.nn.Module,
-    iteration: int,
-    stage: str
+    iteration: int
 ) -> None:
     """
-    Log gradient norms for debugging.
-
-    Args:
-        writer: TensorBoard writer
-        model: Model to log gradients for
-        iteration: Current training step
-        stage: Training stage name
+    Logs the global norm and global mean of all parameters and gradients.
     """
-    if stage != "detector":
+    # Filter parameters that have gradients
+    params = [p for p in model.parameters() if p.grad is not None]
+    
+    if not params:
         return
 
-    total_norm = 0.0
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            param_norm = param.grad.data.norm(2).item()
-            total_norm += param_norm ** 2
-            # Log score_head gradients specifically
-            if "score_head" in name:
-                writer.add_scalar(f"gradients/score_head_{name}", param_norm, iteration)
+    # --- 1. Global Gradient Statistics ---
+    # Global Norm: sqrt(sum(||g_i||^2))
+    # This follows the standard implementation used in grad clipping
+    grad_norms = [torch.norm(p.grad.detach(), 2) for p in params]
+    global_grad_norm = torch.norm(torch.stack(grad_norms), 2).item()
+    
+    # Global Mean: total_sum / total_elements
+    grad_sum = sum(p.grad.detach().sum().item() for p in params)
+    grad_elements = sum(p.grad.numel() for p in params)
+    global_grad_mean = grad_sum / grad_elements
 
-    total_norm = total_norm ** 0.5
-    writer.add_scalar("gradients/total_norm", total_norm, iteration)
+    # --- 2. Global Weight Statistics ---
+    # Global Norm: sqrt(sum(||w_i||^2))
+    weight_norms = [torch.norm(p.detach(), 2) for p in params]
+    global_weight_norm = torch.norm(torch.stack(weight_norms), 2).item()
+    
+    # Global Mean: total_sum / total_elements
+    weight_sum = sum(p.detach().sum().item() for p in params)
+    weight_elements = sum(p.numel() for p in params)
+    global_weight_mean = weight_sum / weight_elements
 
+    # --- 3. Logging to TensorBoard ---
+    # Logging Gradients
+    writer.add_scalar("gradients/global_norm", global_grad_norm, iteration)
+    writer.add_scalar("gradients/global_mean", global_grad_mean, iteration)
+    
+    # Logging Weights
+    writer.add_scalar("weights/global_norm", global_weight_norm, iteration)
+    writer.add_scalar("weights/global_mean", global_weight_mean, iteration)
 
 def build_postfix(
     stage: str,

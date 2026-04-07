@@ -31,11 +31,15 @@ class DetectorLoss(nn.Module):
         )
         self.epsilon = epsilon
 
-    def compute_reward(self, distances: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def compute_reward(
+        self, distances: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Compute reward using the configured reward function."""
         return self.reward_fn(distances, valid_mask)
 
-    def normalize_reward(self, rewards: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, bool]:
+    def normalize_reward(
+        self, rewards: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, bool]:
         """
         Normalize reward following DaD paper:
         rho' = rho / (E[rho] + epsilon)
@@ -112,7 +116,9 @@ class DetectorLoss(nn.Module):
             valid_mask: (B, N) boolean mask for valid keypoints
         """
         # Compute Euclidean distance from reprojection errors, distances shape: (B, N)
-        assert reprojection_errors.dim() == 2, f"Unexpected reprojection_errors dim: {reprojection_errors.dim()}"
+        assert (
+            reprojection_errors.dim() == 2
+        ), f"Unexpected reprojection_errors dim: {reprojection_errors.dim()}"
         distances = reprojection_errors
         rewards = self.compute_reward(distances, valid_mask)
 
@@ -161,7 +167,9 @@ class RankingLoss(nn.Module):
         self.soft_rank = soft_rank
         self.has_soft_sort = True
 
-    def _soft_rank_approximation(self, scores: torch.Tensor, tau: float = 0.1) -> torch.Tensor:
+    def _soft_rank_approximation(
+        self, scores: torch.Tensor, tau: float = 0.1
+    ) -> torch.Tensor:
         """Differentiable soft rank approximation using softmax."""
         B, N = scores.shape
         scores_normalized = scores - scores.mean(dim=-1, keepdim=True)
@@ -202,12 +210,12 @@ class RankingLoss(nn.Module):
         soft_ranks_a = self.soft_rank(
             ranker_scores_a,
             direction="DESCENDING",
-            regularization_strength=self.regularization_strength
+            regularization_strength=self.regularization_strength,
         )
         soft_ranks_b = self.soft_rank(
             ranker_scores_b,
             direction="DESCENDING",
-            regularization_strength=self.regularization_strength
+            regularization_strength=self.regularization_strength,
         )
 
         # Normalize ranks to [0, 1] for numerical stability
@@ -218,13 +226,19 @@ class RankingLoss(nn.Module):
 
         # Spearman Loss (Eq. 4)
         # Get ranks of matched keypoints using boolean indexing
-        matched_ranks_a = soft_ranks_a_norm[mutual_mask_a]  # (M,) where M = total matches across batch
+        matched_ranks_a = soft_ranks_a_norm[
+            mutual_mask_a
+        ]  # (M,) where M = total matches across batch
 
         if len(matched_ranks_a) > 0:
             # Get corresponding ranks in view B
-            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # (B, N)
+            batch_idx = (
+                torch.arange(B, device=device).unsqueeze(1).expand(-1, N)
+            )  # (B, N)
             matched_idx_b = nearest_idx_a[mutual_mask_a]  # (M,)
-            matched_ranks_b = soft_ranks_b_norm[batch_idx[mutual_mask_a], matched_idx_b]  # (M,)
+            matched_ranks_b = soft_ranks_b_norm[
+                batch_idx[mutual_mask_a], matched_idx_b
+            ]  # (M,)
 
             # MSE loss on normalized ranks
             spearman_loss = F.mse_loss(matched_ranks_a, matched_ranks_b)
@@ -236,8 +250,8 @@ class RankingLoss(nn.Module):
         #         unmatched keypoints → rank N (target 1 after normalization)
         target_a = torch.where(
             mutual_mask_a,
-            torch.zeros_like(soft_ranks_a_norm),   # matched: pull to rank 1 → target 0
-            torch.ones_like(soft_ranks_a_norm)     # unmatched: pull to rank N → target 1
+            torch.zeros_like(soft_ranks_a_norm),  # matched: pull to rank 1 → target 0
+            torch.ones_like(soft_ranks_a_norm),  # unmatched: pull to rank N → target 1
         )
 
         pull_loss = F.l1_loss(soft_ranks_a_norm, target_a)
@@ -245,9 +259,15 @@ class RankingLoss(nn.Module):
         total_loss = spearman_loss + self.lambda_ranker * pull_loss
 
         return total_loss, {
-            "spearman_loss": spearman_loss.item() if isinstance(spearman_loss, torch.Tensor) else 0.0,
-            "pull_loss": pull_loss.item() if isinstance(pull_loss, torch.Tensor) else 0.0,
-            "total_loss": total_loss.item() if isinstance(total_loss, torch.Tensor) else 0.0,
+            "spearman_loss": (
+                spearman_loss.item() if isinstance(spearman_loss, torch.Tensor) else 0.0
+            ),
+            "pull_loss": (
+                pull_loss.item() if isinstance(pull_loss, torch.Tensor) else 0.0
+            ),
+            "total_loss": (
+                total_loss.item() if isinstance(total_loss, torch.Tensor) else 0.0
+            ),
         }
 
 
@@ -289,57 +309,34 @@ class CovarianceLoss(nn.Module):
 
         # Propagate covariance through homography
         # sigma_b_propagated = J @ cov_b @ J^T
-        sigma_b_propagated = torch.einsum(
-            'mij,mjk,mkl->mil',
-            jacobian, covariances_b, jacobian.transpose(-1, -2)
+        sigma_a_propagated = torch.einsum(
+            "mij,mjk,mlk->mil", jacobian, covariances_a, jacobian
         )
 
         # Combined error covariance
-        sigma_error = covariances_a + sigma_b_propagated  # (TotalM, 2, 2)
+        sigma_error = covariances_a + sigma_a_propagated  # (TotalM, 2, 2)
 
         # Add epsilon for numerical stability
-        eps_matrix = self.epsilon * torch.eye(2, device=device)
-        sigma_error = sigma_error + eps_matrix
+        sigma_error = sigma_error + self.epsilon * torch.eye(2, device=device)
 
         # Ensure positive definite
         try:
             eigenvalues, eigenvectors = torch.linalg.eigh(sigma_error)
-            eigenvalues = torch.clamp(eigenvalues, min=self.epsilon)
-            sigma_error = torch.einsum(
-                '...ij,...j,...kj->...ik',
-                eigenvectors, eigenvalues, eigenvectors
-            )
         except RuntimeError:
             logger.warning("Eigendecomposition failed in forward")
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            zero = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero, {"log_det": zero, "mahalanobis": zero, "total_points": TotalM}
 
-        # Check for NaN/Inf
-        if not torch.isfinite(sigma_error).all():
-            logger.warning("NaN/Inf in sigma_error")
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        eigenvalues = torch.clamp(eigenvalues, min=self.epsilon)
 
-        # Cholesky decomposition for inverse
-        try:
-            L = torch.linalg.cholesky(sigma_error)  # (TotalM, 2, 2)
-            sigma_inv = torch.cholesky_inverse(L)  # (TotalM, 2, 2)
-            log_det = 2 * torch.log(
-                torch.diagonal(L, dim1=-2, dim2=-1).clamp(min=self.epsilon)
-            ).sum(dim=-1)  # (TotalM,)
-        except RuntimeError:
-            # Fallback to pseudo-inverse
-            sigma_inv = torch.linalg.pinv(sigma_error)
-            det = torch.det(sigma_error)
-            log_det = torch.log(det.clamp(min=self.epsilon))
+        sigma_inv = torch.einsum(
+            "...ij,...j,...kj->...ik", eigenvectors, 1.0 / eigenvalues, eigenvectors
+        )
 
-        # Check for NaN/Inf
-        if not torch.isfinite(sigma_inv).all() or not torch.isfinite(log_det).all():
-            logger.warning("NaN/Inf in sigma_inv or log_det")
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        log_det = 2 * torch.log(eigenvectors).sum(dim=-1)  # (TotalM,)
 
-        # Mahalanobis distance
         mahalanobis = torch.einsum(
-            'mi,mij,mj->m',
-            reprojection_errors, sigma_inv, reprojection_errors
+            "mi,mij,mj->m", reprojection_errors, sigma_inv, reprojection_errors
         )  # (TotalM,)
 
         if not torch.isfinite(mahalanobis).all():
@@ -349,10 +346,20 @@ class CovarianceLoss(nn.Module):
         # Negative log-likelihood
         nll = 0.5 * (log_det + mahalanobis)  # (TotalM,)
 
+        nll = nll.clamp(max=100.0)
+
         # Final check
-        if not torch.isfinite(nll).all():
-            logger.warning("NaN/Inf in nll")
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        finite_mask = torch.isfinite(nll)
+        if not finite_mask.all():
+            nll = nll[finite_mask]
+            if nll.numel():
+                logger.warning("bad nll in forward")
+                zero = torch.tensor(0.0, device=device, requires_grad=True)
+                return zero, {
+                    "log_det": zero,
+                    "mahalanobis": zero,
+                    "total_points": TotalM,
+                }
 
         # Average over all matched keypoints
         loss = nll.mean()
@@ -393,12 +400,22 @@ class CovarianceLoss(nn.Module):
         mask_a_to_b = valid_mask_a_to_b if valid_mask_a_to_b is not None else valid_mask
         mask_b_to_a = valid_mask_b_to_a if valid_mask_b_to_a is not None else valid_mask
 
-        loss_b_to_a = self.forward(covariances_a, covariances_b, errors_b_to_a, jacobian_b_to_a, mask_b_to_a)
-        loss_a_to_b = self.forward(covariances_b, covariances_a, errors_a_to_b, jacobian_a_to_b, mask_a_to_b)
+        loss_b_to_a = self.forward(
+            covariances_a, covariances_b, errors_b_to_a, jacobian_b_to_a, mask_b_to_a
+        )
+        loss_a_to_b = self.forward(
+            covariances_b, covariances_a, errors_a_to_b, jacobian_a_to_b, mask_a_to_b
+        )
         total_loss = (loss_b_to_a + loss_a_to_b) / 2
 
         return total_loss, {
-            "cov_nll_b_to_a": loss_b_to_a.item() if isinstance(loss_b_to_a, torch.Tensor) else 0.0,
-            "cov_nll_a_to_b": loss_a_to_b.item() if isinstance(loss_a_to_b, torch.Tensor) else 0.0,
-            "cov_total": total_loss.item() if isinstance(total_loss, torch.Tensor) else 0.0,
+            "cov_nll_b_to_a": (
+                loss_b_to_a.item() if isinstance(loss_b_to_a, torch.Tensor) else 0.0
+            ),
+            "cov_nll_a_to_b": (
+                loss_a_to_b.item() if isinstance(loss_a_to_b, torch.Tensor) else 0.0
+            ),
+            "cov_total": (
+                total_loss.item() if isinstance(total_loss, torch.Tensor) else 0.0
+            ),
         }

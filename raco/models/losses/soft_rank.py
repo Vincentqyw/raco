@@ -29,7 +29,7 @@ def isotonic_regression_l2(y: np.ndarray) -> np.ndarray:
     Pure Python implementation of PAV (Pool Adjacent Violators) algorithm.
     Time complexity: O(n)
 
-    This implementation follows scikit-learn's PAV algorithm adapted for
+    This implementation uses a stack-based approach that guarantees
     monotonically decreasing output.
 
     Args:
@@ -38,48 +38,38 @@ def isotonic_regression_l2(y: np.ndarray) -> np.ndarray:
     Returns:
         Solution array [n] (monotonically decreasing)
     """
-    n = y.shape[0]
-    target = np.arange(n)
-    c = np.ones(n)
-    sums = np.zeros(n)
+    n = len(y)
+    if n == 0:
+        return y
+
+    # Each block: (start_index, end_index, value, weight)
+    # We use a list as a stack
+    blocks = []
+
+    for i, val in enumerate(y):
+        # Start new block: single element
+        blocks.append((i, i, val, 1))
+
+        # Merge while last two blocks violate monotonic decreasing constraint
+        # Constraint: block values should be >= (non-increasing)
+        while len(blocks) > 1 and blocks[-2][2] < blocks[-1][2]:
+            # Merge last two blocks (violation: previous < current)
+            s1, e1, v1, w1 = blocks[-2]  # Previous block
+            s2, e2, v2, w2 = blocks[-1]  # Current block
+
+            # Compute weighted average for merged block
+            new_val = (v1 * w1 + v2 * w2) / (w1 + w2)
+            new_block = (s1, e2, new_val, w1 + w2)
+
+            # Replace last two blocks with merged block
+            blocks[-2] = new_block
+            blocks.pop()
+
+    # Build solution from blocks
     solution = np.zeros(n)
+    for start, end, value, _ in blocks:
+        solution[start:end+1] = value
 
-    # target describes a list of blocks. At any time, if [i..j] (inclusive) is
-    # an active block, then target[i] := j and target[j] := i.
-
-    for i in range(n):
-        solution[i] = y[i]
-        sums[i] = y[i]
-
-    i = 0
-    while i < n:
-        k = target[i] + 1
-        if k == n:
-            break
-        if solution[i] > solution[k]:
-            i = k
-            continue
-        sum_y = sums[i]
-        sum_c = c[i]
-        while True:
-            # We are within an increasing subsequence.
-            prev_y = solution[k]
-            sum_y += sums[k]
-            sum_c += c[k]
-            k = target[k] + 1
-            if k == n or prev_y > solution[k]:
-                # Non-singleton increasing subsequence is finished,
-                # update first entry.
-                solution[i] = sum_y / sum_c
-                sums[i] = sum_y
-                c[i] = sum_c
-                target[i] = k - 1
-                target[k - 1] = i
-                if i > 0:
-                    # Backtrack if we can. This makes the algorithm
-                    # single-pass and ensures O(n) complexity.
-                    i = target[i - 1]
-                break
     return solution
 
 

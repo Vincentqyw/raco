@@ -314,12 +314,12 @@ class StageTrainer:
         if self.use_amp:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
         # Step scheduler
@@ -375,6 +375,7 @@ class StageTrainer:
 
                 # Logging
                 if iteration % self.log_interval == 0:
+                    log_gradients(self.writer, self.model, iteration)
                     self.writer.add_scalar(f"{self.stage}/loss", loss.item(), iteration)
                     self.writer.add_scalar(f"{self.stage}/lr", self.scheduler.get_last_lr()[0], iteration)
 
@@ -388,9 +389,6 @@ class StageTrainer:
                     elif self.stage == "ranker_covariance":
                         log_ranker_covariance_metrics(self.writer, iteration, loss_metrics)
 
-                    # Gradient norms
-                    if iteration % 500 == 0:
-                        log_gradients(self.writer, self.model, iteration, self.stage)
 
                 iteration += 1
                 pbar.update(1)
